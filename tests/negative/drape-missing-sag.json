@@ -1,0 +1,18 @@
+{
+  "forgeSpec": 1,
+  "slug": "neg-drape-missing-sag",
+  "label": "drape without sagM",
+  "detail": "low",
+  "materials": { "fabric": { "color": "#e8d8e2", "doubleSided": true } },
+  "parts": [
+    {
+      "name": "swag",
+      "type": "drape",
+      "position": [0, 0, 0],
+      "material": "fabric",
+      "from": [-1, 2.4, 0],
+      "to": [1, 2.4, 0],
+      "widthM": 0.5
+    }
+  ]
+}

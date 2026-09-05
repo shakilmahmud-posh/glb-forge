@@ -1,0 +1,33 @@
+{
+  "forgeSpec": 1,
+  "label": "negative",
+  "detail": "low",
+  "slug": "set-with-parts",
+  "members": [
+    {
+      "spec": "x-banner",
+      "position": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "parts": [
+    {
+      "name": "extra",
+      "type": "box",
+      "position": [
+        0,
+        0.5,
+        0
+      ],
+      "material": "m",
+      "size": [
+        1,
+        1,
+        1
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "forgeSpec": 1,
+  "slug": "demo-set",
+  "label": "Demo set \u2014 two x-banners, one rotated 90\u00b0",
+  "detail": "high",
+  "members": [
+    {
+      "spec": "x-banner",
+      "position": [
+        -0.6,
+        0,
+        0
+      ]
+    },
+    {
+      "spec": "x-banner",
+      "as": "x-banner-rot",
+      "position": [
+        0.6,
+        0,
+        0
+      ],
+      "rotationYDeg": 90
+    }
+  ]
+}

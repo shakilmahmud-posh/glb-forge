@@ -1,0 +1,13 @@
+{
+  "pass": true,
+  "triCount": 448,
+  "materialCount": 1,
+  "gates": {
+    "budget": "pass",
+    "footprint": "pass",
+    "baseY": "pass",
+    "materials": "pass",
+    "fileSize": "pass",
+    "geometry": "pass"
+  }
+}

@@ -1,0 +1,999 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Blender Forge — review</title>
+    <style>
+      :root {
+        --paper: #f6f2ea;
+        --ink: #2b2620;
+        --muted: #8a8073;
+        --line: #e2d9c8;
+        --card: #fffdf8;
+        --green: #1e6b2e;
+        --green-bg: #e5f3e5;
+        --red: #a3231f;
+        --red-bg: #fbe4e4;
+        --amber: #8a5b00;
+        --amber-bg: #faedd2;
+        --blue: #1d4f8f;
+        --blue-bg: #e2ecf9;
+        --dark: #14110d;
+        --panel: #201b14;
+        --panel-ink: #ece4d4;
+        --panel-muted: #a99f8c;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font:
+          14px/1.5 -apple-system,
+          "Segoe UI",
+          sans-serif;
+        background: var(--paper);
+        color: var(--ink);
+        margin: 0;
+      }
+      header {
+        padding: 22px 28px 14px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0;
+      }
+      h1 span {
+        color: var(--muted);
+        font-weight: 400;
+      }
+      .meta {
+        color: var(--muted);
+        font-size: 12px;
+        margin: 4px 0 0;
+      }
+      .filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 10px 0 0;
+      }
+      .chip {
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--ink);
+        cursor: pointer;
+      }
+      .chip:hover:not(:disabled) {
+        border-color: var(--muted);
+      }
+      .chip.on {
+        background: var(--ink);
+        color: var(--paper);
+        border-color: var(--ink);
+      }
+      .chip:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .chip .n {
+        opacity: 0.65;
+        margin-left: 4px;
+      }
+      .empty {
+        color: var(--muted);
+        font-size: 13px;
+        padding: 26px 28px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+        gap: 14px;
+        padding: 8px 28px 96px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        cursor: pointer;
+        transition:
+          transform 0.12s ease,
+          box-shadow 0.12s ease;
+      }
+      .card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 18px rgba(60, 48, 30, 0.12);
+      }
+      .card img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 1;
+        object-fit: contain;
+        background: #f2ede4;
+        border-bottom: 1px solid var(--line);
+      }
+      .card .body {
+        padding: 10px 12px 12px;
+      }
+      .slug {
+        font-weight: 700;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 13px;
+      }
+      .label {
+        color: var(--muted);
+        font-size: 12px;
+        margin: 2px 0 8px;
+        min-height: 16px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+      }
+      .badge {
+        display: inline-block;
+        padding: 1px 9px;
+        border-radius: 999px;
+        font-weight: 600;
+        font-size: 11px;
+      }
+      .b-pass {
+        background: var(--green-bg);
+        color: var(--green);
+      }
+      .b-fail {
+        background: var(--red-bg);
+        color: var(--red);
+      }
+      .b-pending {
+        background: #eee8db;
+        color: var(--muted);
+      }
+      .b-approved {
+        background: var(--green-bg);
+        color: var(--green);
+      }
+      .b-changes {
+        background: var(--amber-bg);
+        color: var(--amber);
+      }
+      .b-rejected {
+        background: var(--red-bg);
+        color: var(--red);
+      }
+      .b-shipped {
+        background: var(--blue-bg);
+        color: var(--blue);
+      }
+      .b-kind {
+        background: #efe9dc;
+        color: #6f675c;
+        font-weight: 500;
+      }
+
+      .importbar {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: var(--ink);
+        color: #f3ecdd;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 28px;
+        font-size: 13px;
+        z-index: 40;
+      }
+      .importbar code {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 12px;
+        background: #3a332a;
+        padding: 5px 10px;
+        border-radius: 6px;
+        user-select: all;
+        overflow-x: auto;
+        white-space: nowrap;
+        flex: 1;
+      }
+      .importbar button {
+        background: #f3ecdd;
+        color: var(--ink);
+        border: 0;
+        border-radius: 6px;
+        padding: 6px 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .hidden {
+        display: none !important;
+      }
+
+      .modal {
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        display: flex;
+        background: var(--dark);
+      }
+      #canvas-wrap {
+        position: relative;
+        flex: 1;
+        min-width: 0;
+      }
+      #canvas-wrap canvas {
+        display: block;
+      }
+      .fab {
+        position: absolute;
+        background: rgba(32, 27, 20, 0.82);
+        color: var(--panel-ink);
+        border: 1px solid #3a332a;
+        border-radius: 8px;
+        width: 38px;
+        height: 38px;
+        font-size: 16px;
+        cursor: pointer;
+        z-index: 5;
+      }
+      .fab:hover {
+        background: #3a332a;
+      }
+      #close {
+        top: 14px;
+        right: 14px;
+      }
+      #bg-toggle {
+        top: 14px;
+        right: 60px;
+      }
+      #prev {
+        top: 50%;
+        left: 14px;
+        transform: translateY(-50%);
+      }
+      #next {
+        top: 50%;
+        right: 14px;
+        transform: translateY(-50%);
+      }
+      #load-msg {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: var(--panel-muted);
+        font-size: 13px;
+        pointer-events: none;
+      }
+      #hint {
+        position: absolute;
+        left: 14px;
+        bottom: 12px;
+        color: #7d7362;
+        font-size: 11px;
+        pointer-events: none;
+      }
+
+      aside {
+        width: 344px;
+        flex: none;
+        background: var(--panel);
+        color: var(--panel-ink);
+        padding: 20px 20px 24px;
+        overflow-y: auto;
+        border-left: 1px solid #3a332a;
+      }
+      aside h2 {
+        font-size: 16px;
+        margin: 0 0 2px;
+      }
+      aside .slug {
+        color: var(--panel-muted);
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin: 10px 0 14px;
+      }
+      .chips .badge {
+        background: #332c21;
+        color: #c9bfa9;
+        font-weight: 500;
+      }
+      dl {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 3px 14px;
+        margin: 0 0 14px;
+        font-size: 12.5px;
+      }
+      dt {
+        color: var(--panel-muted);
+      }
+      dd {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+      }
+      .gates {
+        margin: 0 0 16px;
+        font-size: 12.5px;
+      }
+      .gates .row {
+        display: flex;
+        justify-content: space-between;
+        padding: 3px 0;
+        border-bottom: 1px solid #2c261d;
+      }
+      .g-pass {
+        color: #8fd19a;
+      }
+      .g-fail {
+        color: #f2988f;
+        font-weight: 700;
+      }
+      .sect {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--panel-muted);
+        margin: 0 0 6px;
+      }
+      #p-refs img {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid #3a332a;
+        margin-bottom: 8px;
+      }
+      .decide {
+        border-top: 1px solid #3a332a;
+        padding-top: 14px;
+        margin-top: 4px;
+      }
+      .state {
+        font-size: 12.5px;
+        margin-bottom: 10px;
+      }
+      .state .badge {
+        font-size: 11.5px;
+      }
+      .state .note {
+        color: var(--panel-muted);
+        margin-top: 6px;
+        white-space: pre-wrap;
+      }
+      textarea {
+        width: 100%;
+        min-height: 64px;
+        background: #171310;
+        color: var(--panel-ink);
+        border: 1px solid #3a332a;
+        border-radius: 8px;
+        padding: 8px 10px;
+        font: 12.5px/1.5 inherit;
+        resize: vertical;
+      }
+      textarea.attention {
+        border-color: var(--amber);
+        outline: 1px solid var(--amber);
+      }
+      .btns {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .btns button {
+        flex: 1;
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 0;
+        font-weight: 700;
+        font-size: 12.5px;
+        cursor: pointer;
+        color: #fff;
+      }
+      .approve {
+        background: #2e7d32;
+      }
+      .approve:hover {
+        background: #256b29;
+      }
+      .changes {
+        background: #a8770c;
+      }
+      .changes:hover {
+        background: #93680a;
+      }
+      .reject {
+        background: #b3261e;
+      }
+      .reject:hover {
+        background: #9c1f18;
+      }
+      .linkish {
+        background: none;
+        border: 0;
+        color: var(--panel-muted);
+        font-size: 11.5px;
+        cursor: pointer;
+        text-decoration: underline;
+        margin-top: 10px;
+        padding: 0;
+      }
+      #toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translate(-50%, 80px);
+        background: var(--ink);
+        color: #f3ecdd;
+        padding: 10px 20px;
+        border-radius: 8px;
+        font-size: 13px;
+        transition: transform 0.2s ease;
+        z-index: 60;
+      }
+      #toast.show {
+        transform: translate(-50%, 0);
+      }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "/vendor/three.module.min.js" } }
+    </script>
+  </head>
+  <body>
+    <header>
+      <h1>Blender Forge <span>— review</span></h1>
+      <p class="meta" id="meta">loading staged assets…</p>
+      <nav class="filters" id="filters"></nav>
+    </header>
+    <main id="grid" class="grid"></main>
+
+    <footer id="importbar" class="importbar hidden">
+      <span id="approved-count"></span>
+      <code id="import-cmd"></code>
+      <button id="copy-cmd">Copy</button>
+    </footer>
+
+    <div id="modal" class="modal hidden">
+      <div id="canvas-wrap">
+        <div id="load-msg"></div>
+        <button id="close" class="fab" title="Close (Esc)">✕</button>
+        <button id="bg-toggle" class="fab" title="Toggle background">☀</button>
+        <button id="prev" class="fab" title="Previous (←)">‹</button>
+        <button id="next" class="fab" title="Next (→)">›</button>
+        <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+      </div>
+      <aside>
+        <h2 id="p-label"></h2>
+        <div id="p-slug" class="slug"></div>
+        <div id="p-chips" class="chips"></div>
+        <p class="sect">Metrics</p>
+        <dl id="p-metrics"></dl>
+        <p class="sect">Gates</p>
+        <div id="p-gates" class="gates"></div>
+        <div id="p-refs"></div>
+        <div class="decide">
+          <p class="sect">Decision</p>
+          <div id="p-state" class="state"></div>
+          <textarea
+            id="note"
+            placeholder="Notes / change request for the authoring session…"
+          ></textarea>
+          <div class="btns">
+            <button class="approve" id="btn-approve">Approve</button>
+            <button class="changes" id="btn-changes">Changes</button>
+            <button class="reject" id="btn-reject">Reject</button>
+          </div>
+          <button id="btn-reset" class="linkish">reset to pending</button>
+        </div>
+      </aside>
+    </div>
+    <div id="toast"></div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { GLTFLoader } from "/vendor/loaders/GLTFLoader.js";
+      import { DRACOLoader } from "/vendor/loaders/DRACOLoader.js";
+      import { OrbitControls } from "/vendor/controls/OrbitControls.js";
+
+      const $ = (id) => document.getElementById(id);
+      let assets = [];
+      let cur = -1;
+      let darkBg = true;
+
+      const DECISION_BADGE = {
+        approved: ["approved", "b-approved"],
+        changes: ["changes requested", "b-changes"],
+        rejected: ["rejected", "b-rejected"],
+      };
+
+      function badge(text, cls) {
+        const s = document.createElement("span");
+        s.className = `badge ${cls}`;
+        s.textContent = text;
+        return s;
+      }
+
+      function decisionBadge(a) {
+        const d = a.decision && a.decision.decision;
+        const [text, cls] = DECISION_BADGE[d] || ["pending", "b-pending"];
+        return badge(text, cls);
+      }
+
+      // ---------------------------------------------------------------- filters
+      // A review page's job is the queue, so it opens on what is still waiting
+      // — 76 staged assets with 2 pending is not a list anyone should scroll.
+      // Counts sit on every chip, and the active one is filled, so nothing is
+      // hidden without saying so.
+      const FILTERS = [
+        { key: "pending", label: "Needs review", test: (a) => !a.decision },
+        { key: "approved", label: "Approved", test: (a) => a.decision?.decision === "approved" },
+        { key: "changes", label: "Changes requested", test: (a) => a.decision?.decision === "changes" },
+        { key: "rejected", label: "Rejected", test: (a) => a.decision?.decision === "rejected" },
+        { key: "gatefail", label: "Gate fails", test: (a) => !a.report.pass },
+        { key: "all", label: "All", test: () => true },
+      ];
+      let filter = "all";
+      // Indices into `assets` that survive the current filter. The modal and
+      // its ← / → walk THIS, not the full list, or the arrows would wander
+      // into cards the grid is not showing.
+      let view = [];
+
+      function renderFilters() {
+        const bar = $("filters");
+        bar.textContent = "";
+        for (const f of FILTERS) {
+          const n = assets.filter(f.test).length;
+          const b = document.createElement("button");
+          b.className = `chip${f.key === filter ? " on" : ""}`;
+          b.textContent = f.label;
+          const c = document.createElement("span");
+          c.className = "n";
+          c.textContent = n;
+          b.append(c);
+          // An empty bucket stays visible but unclickable — the layout holds
+          // still, and "0 rejected" is itself worth reading.
+          b.disabled = n === 0 && f.key !== "all";
+          b.addEventListener("click", () => {
+            filter = f.key;
+            renderFilters();
+            renderGrid();
+          });
+          bar.append(b);
+        }
+      }
+
+      // ------------------------------------------------------------------ grid
+      function renderGrid() {
+        const grid = $("grid");
+        grid.textContent = "";
+        const f = FILTERS.find((x) => x.key === filter) ?? FILTERS.at(-1);
+        view = assets.map((a, i) => (f.test(a) ? i : -1)).filter((i) => i >= 0);
+        for (const i of view) {
+          const a = assets[i];
+          const card = document.createElement("div");
+          card.className = "card";
+          const img = document.createElement("img");
+          img.loading = "lazy";
+          img.alt = a.slug;
+          img.src = a.thumb ? `/staging/${a.slug}/thumb.png` : "";
+          const body = document.createElement("div");
+          body.className = "body";
+          const slug = document.createElement("div");
+          slug.className = "slug";
+          slug.textContent = a.slug;
+          const label = document.createElement("div");
+          label.className = "label";
+          label.textContent = a.label || "";
+          label.title = a.label || "";
+          const badges = document.createElement("div");
+          badges.className = "badges";
+          badges.append(
+            badge(
+              `${a.hints.kind || "?"} · ${a.report.triCount} tris`,
+              "b-kind",
+            ),
+            a.report.pass
+              ? badge("gates pass", "b-pass")
+              : badge("gate fail", "b-fail"),
+            decisionBadge(a),
+          );
+          for (const c of a.shipped)
+            badges.append(badge(`in ${c}`, "b-shipped"));
+          body.append(slug, label, badges);
+          card.append(img, body);
+          card.addEventListener("click", () => openModal(i));
+          grid.append(card);
+        }
+        if (!view.length) {
+          const e = document.createElement("p");
+          e.className = "empty";
+          e.textContent =
+            filter === "pending"
+              ? "Nothing waiting on you — every staged asset has been decided."
+              : `No staged asset matches “${f.label}”.`;
+          grid.append(e);
+        }
+        const n = assets.length;
+        const approved = assets.filter(
+          (a) => a.decision?.decision === "approved",
+        ).length;
+        const pending = assets.filter((a) => !a.decision).length;
+        const scope =
+          filter === "all"
+            ? `${n} staged asset(s)`
+            : `${view.length} of ${n} staged asset(s) — ${f.label.toLowerCase()}`;
+        $("meta").textContent =
+          `${scope} · ${approved} approved · ${pending} pending — ` +
+          `click a card to inspect in 3D; decisions are saved to staging/<slug>/decision.json`;
+      }
+
+      // ------------------------------------------------------------- import bar
+      function renderImportBar() {
+        const ready = assets.filter(
+          (a) =>
+            a.decision?.decision === "approved" &&
+            !a.shipped.includes("eventos"),
+        );
+        const bar = $("importbar");
+        if (!ready.length) {
+          bar.classList.add("hidden");
+          return;
+        }
+        bar.classList.remove("hidden");
+        $("approved-count").textContent = `${ready.length} approved →`;
+        $("import-cmd").textContent =
+          `./forge import --consumer eventos --slugs ${ready.map((a) => a.slug).join(",")} --authored-by <model>`;
+      }
+      $("copy-cmd").addEventListener("click", async () => {
+        await navigator.clipboard.writeText($("import-cmd").textContent);
+        toast("Import command copied");
+      });
+
+      // ------------------------------------------------------------------ toast
+      let toastTimer;
+      function toast(msg) {
+        const t = $("toast");
+        t.textContent = msg;
+        t.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
+      }
+
+      // ----------------------------------------------------------------- viewer
+      const wrap = $("canvas-wrap");
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      wrap.prepend(renderer.domElement);
+
+      const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.autoRotateSpeed = 1.4;
+      controls.addEventListener("start", () => {
+        controls.autoRotate = false;
+      });
+
+      let scene = null;
+      let running = false;
+      // Harvested assets ship Draco-compressed (the Event OS studio decodes it
+      // via DRACO_PATH), and without a decoder here GLTFLoader throws on
+      // extensionsRequired and the viewer just says "failed to load GLB".
+      // Forge-BUILT assets are uncompressed, which is why this never bit until
+      // the harvest lane existed.
+      const dracoLoader = new DRACOLoader();
+      dracoLoader.setDecoderPath("/vendor/draco/");
+      const loader = new GLTFLoader();
+      loader.setDRACOLoader(dracoLoader);
+
+      function disposeScene() {
+        if (!scene) return;
+        scene.traverse((o) => {
+          if (o.geometry) o.geometry.dispose();
+          if (o.material)
+            (Array.isArray(o.material) ? o.material : [o.material]).forEach(
+              (m) => m.dispose(),
+            );
+        });
+        scene = null;
+      }
+
+      function sceneBg() {
+        if (scene)
+          scene.background = new THREE.Color(darkBg ? 0x17130e : 0xf2ede4);
+      }
+
+      function buildScene() {
+        disposeScene();
+        scene = new THREE.Scene();
+        sceneBg();
+        scene.add(new THREE.HemisphereLight(0xfff7e8, 0x35302a, 1.1));
+        const key = new THREE.DirectionalLight(0xffffff, 2.2);
+        key.position.set(3, 6, 4);
+        scene.add(key);
+        const fill = new THREE.DirectionalLight(0xbfd4ff, 0.6);
+        fill.position.set(-4, 2.5, -3);
+        scene.add(fill);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+      }
+
+      function frameObject(obj) {
+        const box = new THREE.Box3().setFromObject(obj);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z, 0.1);
+        const dist =
+          (maxDim / (2 * Math.tan((camera.fov * Math.PI) / 360))) * 1.45;
+        camera.near = dist / 100;
+        camera.far = dist * 100;
+        camera.position
+          .copy(center)
+          .add(new THREE.Vector3(1, 0.55, 1).normalize().multiplyScalar(dist));
+        camera.updateProjectionMatrix();
+        controls.target.copy(center);
+        controls.update();
+        const grid = new THREE.GridHelper(
+          Math.ceil(maxDim * 2.5),
+          Math.ceil(maxDim * 2.5) * 2,
+          0x5c5648,
+          0x37312a,
+        );
+        grid.position.y = 0;
+        scene.add(grid);
+      }
+
+      function resize() {
+        const w = wrap.clientWidth,
+          h = wrap.clientHeight;
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      }
+      window.addEventListener("resize", () => {
+        if (running) resize();
+      });
+
+      function animate() {
+        if (!running) return;
+        requestAnimationFrame(animate);
+        controls.update();
+        if (scene) renderer.render(scene, camera);
+      }
+
+      function loadCurrent() {
+        const a = assets[cur];
+        buildScene();
+        controls.autoRotate = true;
+        $("load-msg").textContent = a.hasGlb
+          ? "loading GLB…"
+          : "no GLB staged for this asset";
+        if (!a.hasGlb) return;
+        loader.load(
+          `/staging/${a.slug}/${a.slug}.glb`,
+          (gltf) => {
+            if (assets[cur] !== a || !scene) return; // navigated away mid-load
+            scene.add(gltf.scene);
+            frameObject(gltf.scene);
+            $("load-msg").textContent = "";
+          },
+          undefined,
+          () => {
+            $("load-msg").textContent = "failed to load GLB";
+          },
+        );
+      }
+
+      // ------------------------------------------------------------------ panel
+      function fmtBytes(n) {
+        return n > 1024 * 1024
+          ? `${(n / 1048576).toFixed(2)} MB`
+          : `${(n / 1024).toFixed(1)} KB`;
+      }
+
+      function renderPanel() {
+        const a = assets[cur];
+        const r = a.report;
+        $("p-label").textContent = a.label || a.slug;
+        $("p-slug").textContent = a.slug;
+        const chips = $("p-chips");
+        chips.textContent = "";
+        chips.append(
+          badge(a.hints.kind || "?", ""),
+          badge(a.hints.category || a.hints.componentType || "", ""),
+          badge(`${a.detail || "?"} poly`, ""),
+          badge(`placement: ${a.hints.placement || "floor"}`, ""),
+        );
+        for (const c of a.shipped) chips.append(badge(`in ${c}`, "b-shipped"));
+
+        const m = $("p-metrics");
+        m.textContent = "";
+        const rows = [
+          ["triangles", `${r.triCount} / ${r.budget}`],
+          [
+            "bounds",
+            (r.boundsM || []).map((x) => x.toFixed(2)).join(" × ") + " m",
+          ],
+          ["materials", String(r.materialCount)],
+          ["file", fmtBytes(r.fileBytes || 0)],
+          ["baseY", String(r.baseY)],
+          [
+            "built",
+            (r.builtAt || "").replace("T", " ").replace("+00:00", " UTC"),
+          ],
+        ];
+        for (const [k, v] of rows) {
+          const dt = document.createElement("dt");
+          dt.textContent = k;
+          const dd = document.createElement("dd");
+          dd.textContent = v;
+          m.append(dt, dd);
+        }
+
+        const g = $("p-gates");
+        g.textContent = "";
+        for (const [name, val] of Object.entries(r.gates || {})) {
+          const row = document.createElement("div");
+          row.className = "row";
+          const l = document.createElement("span");
+          l.textContent = name;
+          const v = document.createElement("span");
+          v.textContent = val;
+          v.className = val === "pass" ? "g-pass" : "g-fail";
+          row.append(l, v);
+          g.append(row);
+        }
+
+        const refs = $("p-refs");
+        refs.textContent = "";
+        if (a.referenceImages.length) {
+          const h = document.createElement("p");
+          h.className = "sect";
+          h.textContent = "Reference";
+          refs.append(h);
+          for (const rel of a.referenceImages) {
+            const img = document.createElement("img");
+            img.src = `/specs/${rel}`;
+            img.alt = "reference";
+            refs.append(img);
+          }
+        }
+
+        renderDecisionState();
+        $("note").value = a.decision?.note || "";
+        $("note").classList.remove("attention");
+      }
+
+      function renderDecisionState() {
+        const a = assets[cur];
+        const st = $("p-state");
+        st.textContent = "";
+        st.append(decisionBadge(a));
+        if (a.decision?.decidedAt) {
+          st.append(
+            document.createTextNode(
+              `  ${a.decision.decidedAt.replace("T", " ").replace("+00:00", " UTC")}`,
+            ),
+          );
+        }
+        if (a.decision?.note) {
+          const n = document.createElement("div");
+          n.className = "note";
+          n.textContent = a.decision.note;
+          st.append(n);
+        }
+      }
+
+      async function decide(decision) {
+        const a = assets[cur];
+        const note = $("note").value.trim();
+        if (decision === "changes" && !note) {
+          $("note").classList.add("attention");
+          $("note").focus();
+          toast("A change request needs a note");
+          return;
+        }
+        const res = await fetch("/api/decision", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug: a.slug, decision, note }),
+        });
+        const body = await res.json();
+        if (!res.ok) {
+          toast(body.error || "save failed");
+          return;
+        }
+        a.decision = decision === "pending" ? null : body;
+        renderDecisionState();
+        renderFilters();
+        renderGrid();
+        renderImportBar();
+        toast(
+          decision === "pending"
+            ? `${a.slug} reset to pending`
+            : `${a.slug}: ${decision} saved`,
+        );
+      }
+
+      $("btn-approve").addEventListener("click", () => decide("approved"));
+      $("btn-changes").addEventListener("click", () => decide("changes"));
+      $("btn-reject").addEventListener("click", () => decide("rejected"));
+      $("btn-reset").addEventListener("click", () => decide("pending"));
+      $("note").addEventListener("input", () =>
+        $("note").classList.remove("attention"),
+      );
+
+      // ------------------------------------------------------------------ modal
+      function openModal(i) {
+        cur = i;
+        $("modal").classList.remove("hidden");
+        running = true;
+        resize();
+        animate();
+        renderPanel();
+        loadCurrent();
+      }
+
+      function closeModal() {
+        running = false;
+        cur = -1;
+        disposeScene();
+        $("modal").classList.add("hidden");
+      }
+
+      function nav(step) {
+        if (cur < 0 || !view.length) return;
+        const at = view.indexOf(cur);
+        cur =
+          at < 0
+            ? // The open asset just left the filter — you approved it while
+              // viewing "Needs review". Move to the next one still queued
+              // rather than dead-ending on a card the grid no longer lists.
+              (view.find((i) => i > cur) ?? view[0])
+            : view[(at + step + view.length) % view.length];
+        renderPanel();
+        loadCurrent();
+      }
+
+      $("close").addEventListener("click", closeModal);
+      $("prev").addEventListener("click", () => nav(-1));
+      $("next").addEventListener("click", () => nav(1));
+      $("bg-toggle").addEventListener("click", () => {
+        darkBg = !darkBg;
+        sceneBg();
+      });
+      document.addEventListener("keydown", (e) => {
+        if (cur < 0 || e.target.tagName === "TEXTAREA") return;
+        if (e.key === "Escape") closeModal();
+        if (e.key === "ArrowLeft") nav(-1);
+        if (e.key === "ArrowRight") nav(1);
+      });
+
+      // ------------------------------------------------------------------- boot
+      (async function boot() {
+        try {
+          assets = await (await fetch("/api/staged")).json();
+        } catch {
+          $("meta").textContent =
+            "failed to load /api/staged — is the forge review server running?";
+          return;
+        }
+        filter = assets.some((a) => !a.decision) ? "pending" : "all";
+        renderFilters();
+        renderGrid();
+        renderImportBar();
+      })();
+    </script>
+  </body>
+</html>

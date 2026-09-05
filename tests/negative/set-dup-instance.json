@@ -1,0 +1,24 @@
+{
+  "forgeSpec": 1,
+  "label": "negative",
+  "detail": "low",
+  "slug": "set-dup-instance",
+  "members": [
+    {
+      "spec": "x-banner",
+      "position": [
+        -1,
+        0,
+        0
+      ]
+    },
+    {
+      "spec": "x-banner",
+      "position": [
+        1,
+        0,
+        0
+      ]
+    }
+  ]
+}

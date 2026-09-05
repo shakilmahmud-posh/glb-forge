@@ -1,0 +1,75 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BLENDER_VERSION: 5.1.1
+
+jobs:
+  suite:
+    name: linux / blender 5.1.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The version is pinned because it is load-bearing: procedural geometry
+      # from a different Blender build can differ, and the golden reports
+      # commit exact triangle counts. `forge doctor` fails on a mismatch.
+      - name: Cache Blender ${{ env.BLENDER_VERSION }}
+        id: cache-blender
+        uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Install Blender ${{ env.BLENDER_VERSION }}
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/blender
+          url="https://download.blender.org/release/Blender5.1/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+          curl -fsSL "$url" | tar -xJ -C ~/blender --strip-components=1
+
+      - name: Blender is the pinned build
+        run: ~/blender/blender --version | head -1
+
+      - name: doctor
+        env:
+          FORGE_BLENDER: /home/runner/blender/blender
+        run: ./forge doctor
+
+      # The suite includes the determinism check. Running it here proves
+      # something the developer's own machine cannot: that the committed golden
+      # triangle counts hold on a different OS and CPU, not just on the laptop
+      # that produced them.
+      - name: full suite
+        env:
+          FORGE_BLENDER: /home/runner/blender/blender
+        run: bash tests/run.sh
+
+  # Gate logic is pure python with no bpy, which is the whole reason it lives
+  # in its own module. Proving it runs with Blender nowhere on the machine is
+  # what keeps that separation honest.
+  gates-without-blender:
+    name: linux / gates only (no blender)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: builder/gates.py imports and evaluates with no Blender present
+        run: |
+          test ! -x "$(command -v blender || echo /nonexistent)" || { echo "blender unexpectedly present"; exit 1; }
+          python3 - <<'PY'
+          import sys; sys.path.insert(0, "builder")
+          import gates                                    # must not need bpy
+          spec = {"slug": "probe", "detail": "low", "sizeM": [1.0, 1.0, 1.0]}
+          metrics = {"triCount": 100, "vertCount": 60, "boundsM": [1.0, 1.0, 1.0],
+                     "baseY": 0.0, "hasNaN": False, "materialCount": 1}
+          report = gates.run_gates(spec, metrics, 1000, "0.1.0", "0" * 64, "2026-01-01T00:00:00Z")
+          print("gates:", report.get("gates"))
+          assert report.get("gates"), "run_gates returned no gate block"
+          print("OK — gate logic evaluated with no Blender on the machine")
+          PY

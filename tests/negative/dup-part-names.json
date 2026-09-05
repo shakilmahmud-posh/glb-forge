@@ -1,0 +1,23 @@
+{
+  "forgeSpec": 1,
+  "slug": "neg-dup-part-names",
+  "label": "duplicate part names",
+  "detail": "low",
+  "materials": { "body": { "color": "#888888" } },
+  "parts": [
+    {
+      "name": "cube",
+      "type": "box",
+      "position": [0, 0.25, 0],
+      "material": "body",
+      "size": [0.5, 0.5, 0.5]
+    },
+    {
+      "name": "cube",
+      "type": "box",
+      "position": [1, 0.25, 0],
+      "material": "body",
+      "size": [0.5, 0.5, 0.5]
+    }
+  ]
+}

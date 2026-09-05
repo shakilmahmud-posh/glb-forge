@@ -1,0 +1,51 @@
+{
+  "forgeSpec": 1,
+  "slug": "x-banner",
+  "label": "X-banner",
+  "detail": "low",
+  "consumerHints": {
+    "eventos": {
+      "kind": "component",
+      "componentType": "x_banner",
+      "footprintM": 0.65,
+      "heightM": 1.65,
+      "placement": "floor"
+    }
+  },
+  "materials": {
+    "frame": { "color": "#3a3a3a", "roughness": 0.6, "metalness": 0.4 },
+    "panel": { "color": "#e8e2d8", "roughness": 0.9 }
+  },
+  "parts": [
+    {
+      "name": "pole-a",
+      "type": "cylinder",
+      "position": [0, 0.828, -0.045],
+      "rotationDeg": [0, 0, 21.5],
+      "material": "frame",
+      "radiusTop": 0.012,
+      "radiusBottom": 0.012,
+      "heightM": 1.78,
+      "segments": 10
+    },
+    {
+      "name": "pole-b",
+      "type": "cylinder",
+      "position": [0, 0.828, -0.03],
+      "rotationDeg": [0, 0, -21.5],
+      "material": "frame",
+      "radiusTop": 0.012,
+      "radiusBottom": 0.012,
+      "heightM": 1.78,
+      "segments": 10
+    },
+    {
+      "name": "panel",
+      "type": "box",
+      "position": [0, 0.9, 0],
+      "material": "panel",
+      "size": [0.6, 1.5, 0.012]
+    }
+  ],
+  "pictureSurface": { "part": "panel", "face": "front" }
+}

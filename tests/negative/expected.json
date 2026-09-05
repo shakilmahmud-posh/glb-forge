@@ -1,0 +1,12 @@
+{
+  "bad-detail.json": "invalid_enum",
+  "missing-size.json": "missing_field",
+  "too-many-materials.json": "too_many_materials",
+  "unknown-material.json": "unknown_material",
+  "missing-component-type.json": "missing_field",
+  "drape-missing-sag.json": "missing_field",
+  "dup-part-names.json": "duplicate_part_name",
+  "set-with-parts.json": "set_exclusive",
+  "set-unknown-member.json": "unknown_member_spec",
+  "set-dup-instance.json": "duplicate_member_name"
+}

@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""forge — Blender Forge CLI. Python 3 stdlib only (no pip deps).
+
+Subcommands:
+  doctor      environment check (Blender pin, layout, staging writable)
+  validate    validate spec file(s) against forgeSpec v1 → machine-readable failures[]
+  build       build spec → staging/<slug>/{glb,thumb,report}      (P1)
+  sheet       render staging/contact-sheet.html                   (P3)
+  from-image  scaffold an image-driven spec                       (P3)
+  harvest     sourced .blend → staged two-LOD decor asset         (P6)
+  import      ship approved slugs to a consumer + ledger          (P4)
+  review      interactive review UI (3D viewer + approve/reject)  (P5+)
+
+Exit codes: 0 ok · 1 gate fail · 2 schema error · 3 environment error.
+Plan of record: ~/dev/.claude/plans/grill-blender-forge.md
+"""
+
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+FORGE_VERSION = "0.1.0"
+BLENDER_PIN = "5.1.1"
+BLENDER_APP = "/Applications/Blender.app/Contents/MacOS/Blender"
+REPO = Path(__file__).resolve().parent
+
+SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+COMPONENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+PART_TYPES = ("box", "cylinder", "plane", "lathe", "drape", "array")
+FACES = ("front", "back", "left", "right", "top")
+DETAILS = ("low", "mid", "high")
+PLACEMENTS = ("floor", "ceiling", "wall")
+BUDGETS = {"low": {"tris": 3000, "bytes": 1_500_000}, "mid": {"tris": 15000, "bytes": 4_000_000},
+           "high": {"tris": 60000, "bytes": 10_000_000}}
+BUILD_TIMEOUT_S = 180
+
+TOP_FIELDS = {"forgeSpec", "slug", "label", "detail", "referenceImages",
+              "consumerHints", "materials", "parts", "pictureSurface", "members"}
+MEMBER_FIELDS = {"spec", "as", "position", "rotationYDeg"}
+MAX_SET_MEMBERS = 24
+MAX_SET_MATERIALS = 12  # after cross-member dedupe (gates.py enforces the same cap)
+MATERIAL_FIELDS = {"color", "roughness", "metalness", "emissive", "doubleSided"}
+EVENTOS_FIELDS = {"kind", "componentType", "category", "footprintM", "heightM",
+                  "defaultHeightM", "placement"}
+TYPE_FIELDS = {
+    "box": {"size", "bevelM"},
+    "cylinder": {"radiusTop", "radiusBottom", "heightM", "segments"},
+    "plane": {"size"},
+    "lathe": {"profile", "segments"},
+    "drape": {"from", "to", "sagM", "widthM", "segmentsAlong", "segmentsAcross",
+              "gatherEnds", "wrinkle"},
+    "array": {"of", "mode", "count", "spacing", "radiusM", "startDeg", "endDeg"},
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _vec(v, n):
+    return isinstance(v, list) and len(v) == n and all(_num(x) for x in v)
+
+
+def _str(v):
+    return isinstance(v, str) and v.strip() != ""
+
+
+# ---------------------------------------------------------------- validator
+
+class Failures:
+    def __init__(self):
+        self.items = []
+
+    def add(self, path, code, message):
+        self.items.append({"path": path, "code": code, "message": message})
+
+
+def _validate_material(name, mat, f):
+    p = f"materials.{name}"
+    if not NAME_RE.match(name):
+        f.add(p, "invalid_format", "material keys are kebab-case")
+    if not isinstance(mat, dict):
+        f.add(p, "wrong_type", "material must be an object")
+        return
+    for k in mat:
+        if k not in MATERIAL_FIELDS:
+            f.add(f"{p}.{k}", "unknown_field", f"unknown material field '{k}'")
+    color = mat.get("color")
+    if color is None:
+        f.add(f"{p}.color", "missing_field", "material requires color (#rrggbb)")
+    elif not (isinstance(color, str) and HEX_RE.match(color)):
+        f.add(f"{p}.color", "invalid_format", "color must be #rrggbb (6 hex digits)")
+    for k in ("roughness", "metalness"):
+        if k in mat and not (_num(mat[k]) and 0 <= mat[k] <= 1):
+            f.add(f"{p}.{k}", "out_of_range", f"{k} must be a number in [0,1]")
+    if "emissive" in mat and not (isinstance(mat["emissive"], str) and HEX_RE.match(mat["emissive"])):
+        f.add(f"{p}.emissive", "invalid_format", "emissive must be #rrggbb")
+    if "doubleSided" in mat and not isinstance(mat["doubleSided"], bool):
+        f.add(f"{p}.doubleSided", "wrong_type", "doubleSided must be boolean")
+
+
+def _validate_part(part, path, materials, f, inline=False):
+    """Validate one part; returns (name, type, fabric_materials_used)."""
+    if not isinstance(part, dict):
+        f.add(path, "wrong_type", "part must be an object")
+        return None, None, []
+    ptype = part.get("type")
+    if ptype not in PART_TYPES:
+        f.add(f"{path}.type", "invalid_enum", f"type must be one of {list(PART_TYPES)}")
+        return part.get("name"), None, []
+
+    allowed = {"name", "type", "position", "rotationDeg"} | TYPE_FIELDS[ptype]
+    if ptype != "array":
+        allowed.add("material")
+    for k in part:
+        if k not in allowed:
+            f.add(f"{path}.{k}", "unknown_field", f"unknown field '{k}' for type {ptype}")
+
+    name = part.get("name")
+    if not inline:
+        if not _str(name):
+            f.add(f"{path}.name", "missing_field", "part requires a name")
+        elif not NAME_RE.match(name):
+            f.add(f"{path}.name", "invalid_format", "part names are kebab-case")
+
+    if not inline and "position" not in part:
+        f.add(f"{path}.position", "missing_field", "part requires position [x,y,z] (metres)")
+    if "position" in part and not _vec(part["position"], 3):
+        f.add(f"{path}.position", "wrong_type", "position must be [x,y,z] numbers")
+    if "rotationDeg" in part and not _vec(part["rotationDeg"], 3):
+        f.add(f"{path}.rotationDeg", "wrong_type", "rotationDeg must be [x,y,z] degrees")
+
+    fabric_mats = []
+    if ptype != "array":
+        mat = part.get("material")
+        if not _str(mat):
+            f.add(f"{path}.material", "missing_field", "part requires a material reference")
+        elif mat not in materials:
+            f.add(f"{path}.material", "unknown_material",
+                  f"material '{mat}' not declared in materials")
+        elif ptype in ("plane", "drape"):
+            fabric_mats.append((mat, path))
+
+    def req(field, ok, msg):
+        if field not in part:
+            f.add(f"{path}.{field}", "missing_field", msg)
+        elif not ok(part[field]):
+            f.add(f"{path}.{field}", "out_of_range", msg)
+
+    if ptype == "box":
+        req("size", lambda v: _vec(v, 3) and all(x > 0 for x in v),
+            "box requires size [x,y,z], all > 0")
+        if "bevelM" in part and not (_num(part["bevelM"]) and part["bevelM"] >= 0):
+            f.add(f"{path}.bevelM", "out_of_range", "bevelM must be ≥ 0")
+
+    elif ptype == "cylinder":
+        req("radiusTop", lambda v: _num(v) and v >= 0, "cylinder requires radiusTop ≥ 0")
+        req("radiusBottom", lambda v: _num(v) and v >= 0, "cylinder requires radiusBottom ≥ 0")
+        req("heightM", lambda v: _num(v) and v > 0, "cylinder requires heightM > 0")
+        if _num(part.get("radiusTop")) and _num(part.get("radiusBottom")) \
+                and part["radiusTop"] == 0 and part["radiusBottom"] == 0:
+            f.add(path, "degenerate_geometry", "radiusTop and radiusBottom cannot both be 0")
+        if "segments" in part and not (_int(part["segments"]) and 3 <= part["segments"] <= 64):
+            f.add(f"{path}.segments", "out_of_range", "segments must be int 3..64")
+
+    elif ptype == "plane":
+        req("size", lambda v: _vec(v, 2) and all(x > 0 for x in v),
+            "plane requires size [w,h], both > 0")
+
+    elif ptype == "lathe":
+        prof = part.get("profile")
+        if prof is None:
+            f.add(f"{path}.profile", "missing_field", "lathe requires profile [[r,y],…] (≥ 2 points)")
+        elif not (isinstance(prof, list) and len(prof) >= 2
+                  and all(_vec(pt, 2) and pt[0] >= 0 for pt in prof)):
+            f.add(f"{path}.profile", "invalid_format",
+                  "profile must be ≥ 2 [r,y] pairs with r ≥ 0")
+        if "segments" in part and not (_int(part["segments"]) and 3 <= part["segments"] <= 64):
+            f.add(f"{path}.segments", "out_of_range", "segments must be int 3..64")
+
+    elif ptype == "drape":
+        req("from", lambda v: _vec(v, 3), "drape requires from [x,y,z]")
+        req("to", lambda v: _vec(v, 3), "drape requires to [x,y,z]")
+        req("sagM", lambda v: _num(v) and v > 0, "drape requires sagM > 0")
+        req("widthM", lambda v: _num(v) and v > 0, "drape requires widthM > 0")
+        if "segmentsAlong" in part and not (_int(part["segmentsAlong"]) and 2 <= part["segmentsAlong"] <= 128):
+            f.add(f"{path}.segmentsAlong", "out_of_range", "segmentsAlong must be int 2..128")
+        if "segmentsAcross" in part and not (_int(part["segmentsAcross"]) and 1 <= part["segmentsAcross"] <= 32):
+            f.add(f"{path}.segmentsAcross", "out_of_range", "segmentsAcross must be int 1..32")
+        if "gatherEnds" in part and not isinstance(part["gatherEnds"], bool):
+            f.add(f"{path}.gatherEnds", "wrong_type", "gatherEnds must be boolean")
+        if "wrinkle" in part:
+            w = part["wrinkle"]
+            if not isinstance(w, dict):
+                f.add(f"{path}.wrinkle", "wrong_type", "wrinkle must be {amplitudeM, seed}")
+            else:
+                for k in w:
+                    if k not in ("amplitudeM", "seed"):
+                        f.add(f"{path}.wrinkle.{k}", "unknown_field", f"unknown wrinkle field '{k}'")
+                if not (_num(w.get("amplitudeM")) and w.get("amplitudeM", 0) > 0):
+                    f.add(f"{path}.wrinkle.amplitudeM", "missing_field", "wrinkle requires amplitudeM > 0")
+                if not _int(w.get("seed")):
+                    f.add(f"{path}.wrinkle.seed", "missing_field",
+                          "wrinkle requires an explicit integer seed (determinism)")
+
+    elif ptype == "array":
+        of = part.get("of")
+        if of is None:
+            f.add(f"{path}.of", "missing_field", "array requires an inline part in 'of'")
+        else:
+            _, of_type, of_fabric = _validate_part(of, f"{path}.of", materials, f, inline=True)
+            fabric_mats.extend(of_fabric)
+            if of_type == "array":
+                f.add(f"{path}.of", "nested_array", "arrays cannot nest in v1")
+        mode = part.get("mode")
+        if mode not in ("linear", "radial"):
+            f.add(f"{path}.mode", "invalid_enum", "array mode must be 'linear' or 'radial'")
+        if not (_int(part.get("count")) and 2 <= part.get("count", 0) <= 256):
+            f.add(f"{path}.count", "out_of_range", "array count must be int 2..256")
+        if mode == "linear":
+            if not _vec(part.get("spacing"), 3):
+                f.add(f"{path}.spacing", "missing_field", "linear array requires spacing [x,y,z]")
+            for k in ("radiusM", "startDeg", "endDeg"):
+                if k in part:
+                    f.add(f"{path}.{k}", "unexpected_field", f"'{k}' is radial-only")
+        elif mode == "radial":
+            if not (_num(part.get("radiusM")) and part.get("radiusM", 0) > 0):
+                f.add(f"{path}.radiusM", "missing_field", "radial array requires radiusM > 0")
+            for k in ("startDeg", "endDeg"):
+                if not _num(part.get(k)):
+                    f.add(f"{path}.{k}", "missing_field", f"radial array requires {k} (degrees)")
+            if "spacing" in part:
+                f.add(f"{path}.spacing", "unexpected_field", "'spacing' is linear-only")
+
+    return name, ptype, fabric_mats
+
+
+# ------------------------------------------------------------ set composition
+#
+# A "set" spec composes committed specs into one asset: {members: [{spec, as?,
+# position, rotationYDeg?}]} instead of materials/parts. The CLI flattens the set
+# into an ordinary spec (namespaced parts, deduped materials, composed transforms)
+# BEFORE Blender runs, so the builder stays untouched and determinism holds:
+# same set spec + same member specs → byte-identical GLB.
+#
+# Rotation maths matches Blender's Euler 'XYZ' convention (apply X, then Y, then
+# Z about global axes ⇒ M = Rz@Ry@Rx); a member's Y-rotation left-multiplies each
+# part's rotation and the result is decomposed back to XYZ degrees.
+
+def _mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _mat_vec(m, v):
+    return [sum(m[i][k] * v[k] for k in range(3)) for i in range(3)]
+
+
+def _rot_y_mat(deg):
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    return [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
+
+
+def _euler_deg_to_mat(deg3):
+    rx, ry, rz = (math.radians(a) for a in deg3)
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    rx_m = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+    ry_m = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+    rz_m = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+    return _mat_mul(rz_m, _mat_mul(ry_m, rx_m))
+
+
+def _mat_to_euler_deg(m):
+    sy = max(-1.0, min(1.0, -m[2][0]))
+    cy = math.sqrt(max(0.0, 1.0 - sy * sy))
+    if cy > 1e-8:
+        rx = math.atan2(m[2][1], m[2][2])
+        ry = math.asin(sy)
+        rz = math.atan2(m[1][0], m[0][0])
+    else:  # gimbal: ry = ±90°, fold everything into rx
+        ry = math.copysign(math.pi / 2.0, sy)
+        rz = 0.0
+        sign = math.copysign(1.0, sy)
+        rx = math.atan2(sign * m[0][1], sign * m[0][2])
+    return [math.degrees(a) for a in (rx, ry, rz)]
+
+
+def _material_sig(mdef):
+    """Identity for cross-member material dedupe — includes every rendered field."""
+    return (mdef["color"].lower(), round(float(mdef.get("roughness", 0.8)), 4),
+            round(float(mdef.get("metalness", 0.0)), 4),
+            (mdef.get("emissive") or "").lower(), bool(mdef.get("doubleSided", False)))
+
+
+def flatten_set(spec):
+    """Set spec → ordinary buildable spec. Raises ValueError on unresolvable members.
+    The flattened dict carries `_set` so gates apply the set material cap."""
+    materials, sig_to_name, parts = {}, {}, []
+    for m in spec["members"]:
+        ref = m["spec"]
+        mspec = _find_spec(ref)
+        if mspec is None:
+            raise ValueError(f"member spec '{ref}' not found in specs/ or examples/")
+        inst = m.get("as", ref)
+        theta = float(m.get("rotationYDeg", 0.0))
+        rot_m = _rot_y_mat(theta)
+        t = [float(x) for x in m["position"]]
+        mat_map = {}
+        for name, mdef in mspec["materials"].items():
+            sig = _material_sig(mdef)
+            if sig in sig_to_name:
+                mat_map[name] = sig_to_name[sig]
+            else:
+                new_name = f"{inst}-{name}"
+                materials[new_name] = mdef
+                sig_to_name[sig] = new_name
+                mat_map[name] = new_name
+        for part in mspec["parts"]:
+            p = json.loads(json.dumps(part))  # deep copy, deterministic
+            p["name"] = f"{inst}-{p['name']}"
+            if p["type"] == "array":
+                p["of"]["material"] = mat_map[p["of"]["material"]]
+            else:
+                p["material"] = mat_map[p["material"]]
+            pos = [float(x) for x in p.get("position", [0.0, 0.0, 0.0])]
+            world = _mat_vec(rot_m, pos)
+            p["position"] = [round(world[j] + t[j], 6) + 0.0 for j in range(3)]
+            if theta:
+                composed = _mat_mul(rot_m, _euler_deg_to_mat(p.get("rotationDeg", [0, 0, 0])))
+                p["rotationDeg"] = [round(a, 4) + 0.0 for a in _mat_to_euler_deg(composed)]
+            parts.append(p)
+    flat = {"forgeSpec": 1, "slug": spec["slug"], "label": spec["label"],
+            "detail": spec["detail"], "materials": materials, "parts": parts,
+            "_set": len(spec["members"])}
+    if spec.get("consumerHints"):
+        flat["consumerHints"] = spec["consumerHints"]
+    return flat
+
+
+def _validate_hints(spec, f):
+    """consumerHints validation — shared by ordinary specs and sets. Returns ev."""
+    hints = spec.get("consumerHints")
+    ev = None
+    if hints is not None:
+        if not isinstance(hints, dict):
+            f.add("consumerHints", "wrong_type", "consumerHints must be an object")
+        elif "eventos" in hints:
+            ev = hints["eventos"]
+            p = "consumerHints.eventos"
+            if not isinstance(ev, dict):
+                f.add(p, "wrong_type", "eventos hints must be an object")
+                ev = None
+            else:
+                for k in ev:
+                    if k not in EVENTOS_FIELDS:
+                        f.add(f"{p}.{k}", "unknown_field", f"unknown eventos hint '{k}'")
+                kind = ev.get("kind")
+                if kind not in ("decor", "component"):
+                    f.add(f"{p}.kind", "invalid_enum", "kind must be 'decor' or 'component'")
+                if kind == "component":
+                    ct = ev.get("componentType")
+                    if not _str(ct):
+                        f.add(f"{p}.componentType", "missing_field",
+                              "kind=component requires componentType (snake_case)")
+                    elif not COMPONENT_TYPE_RE.match(ct):
+                        f.add(f"{p}.componentType", "invalid_format", "componentType is snake_case")
+                    for k in ("category", "defaultHeightM"):
+                        if k in ev:
+                            f.add(f"{p}.{k}", "unexpected_field", f"'{k}' is decor-only")
+                elif kind == "decor":
+                    if not _str(ev.get("category")):
+                        f.add(f"{p}.category", "missing_field", "kind=decor requires category")
+                    if "componentType" in ev:
+                        f.add(f"{p}.componentType", "unexpected_field", "componentType is component-only")
+                    if "defaultHeightM" in ev and not (_num(ev["defaultHeightM"]) and ev["defaultHeightM"] >= 0):
+                        f.add(f"{p}.defaultHeightM", "out_of_range", "defaultHeightM must be ≥ 0")
+                for k in ("footprintM", "heightM"):
+                    if not (_num(ev.get(k)) and ev.get(k, 0) > 0):
+                        f.add(f"{p}.{k}", "missing_field", f"eventos hints require {k} > 0")
+                if "placement" in ev and ev["placement"] not in PLACEMENTS:
+                    f.add(f"{p}.placement", "invalid_enum", f"placement must be one of {list(PLACEMENTS)}")
+    return ev
+
+
+def _validate_members(spec, f):
+    members = spec.get("members")
+    if not (isinstance(members, list) and members):
+        f.add("members", "missing_field", "members must be a non-empty array")
+        return
+    if len(members) > MAX_SET_MEMBERS:
+        f.add("members", "too_many_members", f"{len(members)} members — max {MAX_SET_MEMBERS}")
+    seen = {}
+    for i, m in enumerate(members):
+        p = f"members[{i}]"
+        if not isinstance(m, dict):
+            f.add(p, "wrong_type", "member must be an object")
+            continue
+        for k in m:
+            if k not in MEMBER_FIELDS:
+                f.add(f"{p}.{k}", "unknown_field", f"unknown member field '{k}'")
+        ref = m.get("spec")
+        if not (_str(ref) and SLUG_RE.match(ref)):
+            f.add(f"{p}.spec", "missing_field", "member.spec must be a kebab-case slug")
+            continue
+        mspec = _find_spec(ref)
+        if mspec is None:
+            f.add(f"{p}.spec", "unknown_member_spec",
+                  f"no committed spec named '{ref}' (specs/ or examples/)")
+            continue
+        if "members" in mspec:
+            f.add(f"{p}.spec", "nested_set", f"'{ref}' is itself a set — sets cannot nest (v1)")
+            continue
+        if validate_spec(mspec):
+            f.add(f"{p}.spec", "member_spec_invalid", f"'{ref}' does not validate — fix it first")
+        inst = m.get("as", ref)
+        if not (_str(inst) and NAME_RE.match(inst)):
+            f.add(f"{p}.as", "invalid_format", "member.as must be kebab-case")
+        elif inst in seen:
+            f.add(f"{p}.as", "duplicate_member_name",
+                  f"instance name '{inst}' already used at members[{seen[inst]}] — "
+                  f"give repeats a unique 'as'")
+        else:
+            seen[inst] = i
+        if not _vec(m.get("position"), 3):
+            f.add(f"{p}.position", "missing_field", "member.position must be [x,y,z] metres")
+        if "rotationYDeg" in m and not _num(m["rotationYDeg"]):
+            f.add(f"{p}.rotationYDeg", "wrong_type", "rotationYDeg must be a number")
+    if not f.items:
+        try:
+            flat = flatten_set(spec)
+        except ValueError as e:
+            f.add("members", "flatten_failed", str(e))
+            return
+        n = len(flat["materials"])
+        if n > MAX_SET_MATERIALS:
+            f.add("members", "too_many_materials",
+                  f"{n} distinct materials after dedupe — max {MAX_SET_MATERIALS} per set")
+
+
+def validate_spec(spec):
+    """Validate a parsed forgeSpec v1 dict. Returns list of failure objects."""
+    f = Failures()
+    if not isinstance(spec, dict):
+        f.add("$", "wrong_type", "spec root must be an object")
+        return f.items
+
+    for k in spec:
+        if k not in TOP_FIELDS:
+            f.add(k, "unknown_field", f"unknown top-level field '{k}'")
+
+    if spec.get("forgeSpec") != 1:
+        f.add("forgeSpec", "unsupported_forge_version", "forgeSpec must be 1")
+    slug = spec.get("slug")
+    if not _str(slug):
+        f.add("slug", "missing_field", "slug is required")
+    elif not SLUG_RE.match(slug):
+        f.add("slug", "invalid_slug", "slug must be kebab-case ([a-z0-9-])")
+    if not _str(spec.get("label")):
+        f.add("label", "missing_field", "label is required")
+    if spec.get("detail") not in DETAILS:
+        f.add("detail", "invalid_enum", f"detail must be one of {list(DETAILS)}")
+
+    if "referenceImages" in spec:
+        ri = spec["referenceImages"]
+        if not (isinstance(ri, list) and all(_str(x) for x in ri)):
+            f.add("referenceImages", "wrong_type", "referenceImages must be a list of paths")
+
+    # set spec: members compose other specs — mutually exclusive with own geometry
+    if "members" in spec:
+        for k in ("parts", "materials", "pictureSurface"):
+            if k in spec:
+                f.add(k, "set_exclusive",
+                      f"a set spec must not declare '{k}' — members compose committed specs")
+        _validate_hints(spec, f)
+        _validate_members(spec, f)
+        return f.items
+
+    # materials
+    materials = spec.get("materials")
+    if not isinstance(materials, dict) or not materials:
+        f.add("materials", "missing_field", "materials object with 1..4 entries is required")
+        materials = {}
+    elif len(materials) > 4:
+        f.add("materials", "too_many_materials", f"{len(materials)} materials — max 4 per asset")
+    for mname, mat in materials.items():
+        _validate_material(mname, mat, f)
+
+    # consumerHints
+    ev = _validate_hints(spec, f)
+
+    # parts
+    parts = spec.get("parts")
+    names, types_by_name, fabric_mats = {}, {}, []
+    if not (isinstance(parts, list) and parts):
+        f.add("parts", "missing_field", "parts must be a non-empty array")
+    else:
+        for i, part in enumerate(parts):
+            name, ptype, fabrics = _validate_part(part, f"parts[{i}]", materials, f)
+            fabric_mats.extend(fabrics)
+            if isinstance(name, str) and name:
+                if name in names:
+                    f.add(f"parts[{i}].name", "duplicate_part_name",
+                          f"part name '{name}' already used at parts[{names[name]}]")
+                else:
+                    names[name] = i
+                    types_by_name[name] = ptype
+
+    # fabric materials must render backfaces
+    for mat, path in fabric_mats:
+        if isinstance(materials.get(mat), dict) and materials[mat].get("doubleSided") is not True:
+            f.add(f"materials.{mat}.doubleSided", "fabric_material_must_be_double_sided",
+                  f"material '{mat}' is used by plane/drape at {path} — set doubleSided: true")
+
+    # pictureSurface
+    ps = spec.get("pictureSurface")
+    if ps is not None:
+        if not isinstance(ps, dict):
+            f.add("pictureSurface", "wrong_type", "pictureSurface must be {part, face}")
+        else:
+            for k in ps:
+                if k not in ("part", "face"):
+                    f.add(f"pictureSurface.{k}", "unknown_field", f"unknown field '{k}'")
+            tgt = ps.get("part")
+            if not _str(tgt):
+                f.add("pictureSurface.part", "missing_field", "pictureSurface requires part")
+            elif tgt not in names:
+                f.add("pictureSurface.part", "unknown_part", f"no part named '{tgt}'")
+            elif types_by_name.get(tgt) != "box":
+                f.add("pictureSurface.part", "picture_surface_part_not_box",
+                      "pictureSurface must target a box part (Event OS faces = box faces)")
+            if ps.get("face") not in FACES:
+                f.add("pictureSurface.face", "invalid_enum", f"face must be one of {list(FACES)}")
+            if not (isinstance(ev, dict) and ev.get("kind") == "component"):
+                f.add("pictureSurface", "picture_surface_requires_component",
+                      "pictureSurface only works when consumerHints.eventos.kind=component "
+                      "(Event OS looks bind to floor-plan components, not décor)")
+
+    return f.items
+
+
+# ---------------------------------------------------------------- commands
+
+def find_blender():
+    env = os.environ.get("FORGE_BLENDER")  # test/dev override
+    if env:
+        return env if Path(env).is_file() else None
+    if Path(BLENDER_APP).is_file():
+        return BLENDER_APP
+    return shutil.which("blender")
+
+
+def cmd_doctor(_args):
+    ok = True
+
+    def check(label, passed, detail=""):
+        nonlocal ok
+        mark = "✓" if passed else "✗"
+        print(f"  {mark} {label}" + (f" — {detail}" if detail else ""))
+        ok = ok and passed
+
+    print(f"forge {FORGE_VERSION} doctor")
+    check("python3 ≥ 3.9", sys.version_info >= (3, 9), sys.version.split()[0])
+
+    blender = find_blender()
+    if not blender:
+        check("blender binary", False, "not found (install Blender 5.1.1)")
+    else:
+        try:
+            out = subprocess.run([blender, "--version"], capture_output=True,
+                                 text=True, timeout=30).stdout.splitlines()
+            version = next((ln.split()[1] for ln in out if ln.startswith("Blender ")), "?")
+        except Exception as e:  # noqa: BLE001 — doctor reports, never crashes
+            version = f"error: {e}"
+        check(f"blender pinned {BLENDER_PIN}", version == BLENDER_PIN, f"{blender} → {version}")
+
+    try:
+        json.loads((REPO / "schema" / "forge-spec.schema.json").read_text())
+        check("schema/forge-spec.schema.json", True, "valid JSON")
+    except Exception as e:  # noqa: BLE001
+        check("schema/forge-spec.schema.json", False, str(e))
+
+    for rel in ("builder/builder.py", "builder/gates.py", "SPEC_GUIDE.md"):
+        check(rel, (REPO / rel).is_file())
+
+    # consumers.json and library.json are per-installation state, not part of
+    # the tool. A fresh clone has neither, and `build` does not need them —
+    # only `import` reads consumers, only `harvest` writes the library. Failing
+    # doctor on their absence tells a new user their install is broken when it
+    # is merely empty, so report and carry on.
+    for rel, what in (("consumers.json", "import targets — copy consumers.example.json to add one"),
+                      ("library.json", "harvested-asset index — written on first harvest")):
+        present = (REPO / rel).is_file()
+        print(f"  {'✓' if present else '·'} {rel}"
+              + ("" if present else f" — absent, {what}"))
+
+    try:
+        staging = REPO / "staging"
+        staging.mkdir(exist_ok=True)
+        probe = staging / ".doctor-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        check("staging/ writable", True)
+    except Exception as e:  # noqa: BLE001
+        check("staging/ writable", False, str(e))
+
+    npx = shutil.which("npx")
+    print(f"  {'✓' if npx else '·'} npx (gltf-transform inspect, P1 acceptance)"
+          + ("" if npx else " — optional, not found"))
+
+    print("doctor: OK" if ok else "doctor: FAILED")
+    return 0 if ok else 3
+
+
+def _resolve_spec_paths(args):
+    if args and args[0] == "--all":
+        return sorted(list((REPO / "specs").glob("*.json"))
+                      + list((REPO / "examples").glob("*.json")))
+    paths = []
+    for a in args:
+        p = Path(a)
+        if not p.is_file():
+            p = REPO / "specs" / f"{a}.json"
+        paths.append(p)
+    return paths
+
+
+def cmd_validate(args):
+    if not args:
+        print("usage: forge validate <spec.json|slug> [...] | --all", file=sys.stderr)
+        return 2
+    worst = 0
+    for path in _resolve_spec_paths(args):
+        try:
+            spec = json.loads(Path(path).read_text())
+            failures = validate_spec(spec)
+        except FileNotFoundError:
+            print(json.dumps({"file": str(path), "valid": False, "failures": [
+                {"path": "$", "code": "file_not_found", "message": str(path)}]}))
+            worst = max(worst, 2)
+            continue
+        except json.JSONDecodeError as e:
+            print(json.dumps({"file": str(path), "valid": False, "failures": [
+                {"path": "$", "code": "invalid_json", "message": str(e)}]}))
+            worst = max(worst, 2)
+            continue
+        result = {"file": str(path),
+                  "slug": spec.get("slug") if isinstance(spec, dict) else None,
+                  "valid": not failures, "failures": failures}
+        print(json.dumps(result))
+        if failures:
+            worst = max(worst, 2)
+    return worst
+
+
+def cmd_build(args):
+    if not args:
+        print("usage: forge build <spec.json|slug> [...]", file=sys.stderr)
+        return 2
+    blender = find_blender()
+    if not blender:
+        print("forge: blender not found — run `forge doctor`", file=sys.stderr)
+        return 3
+    worst = 0
+    for path in _resolve_spec_paths(args):
+        try:
+            spec = json.loads(Path(path).read_text())
+            failures = validate_spec(spec)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"forge: {path}: {e}", file=sys.stderr)
+            worst = max(worst, 2)
+            continue
+        if failures:
+            print(json.dumps({"file": str(path), "valid": False, "failures": failures}))
+            worst = max(worst, 2)
+            continue
+        slug = spec["slug"]
+        out = REPO / "staging" / slug
+        out.mkdir(parents=True, exist_ok=True)
+        spec_arg = Path(path).resolve()
+        extra = []
+        if "members" in spec:
+            # flatten set → ordinary spec; report/GLB keep the SET spec's sha
+            # (the committed source of truth), not the derived flattened file's
+            try:
+                flat = flatten_set(spec)
+            except ValueError as e:
+                print(f"forge: {slug}: {e}", file=sys.stderr)
+                worst = max(worst, 2)
+                continue
+            spec_arg = out / "flattened.json"
+            spec_arg.write_text(json.dumps(flat, indent=2) + "\n")
+            extra = ["--spec-sha",
+                     hashlib.sha256(Path(path).resolve().read_bytes()).hexdigest()]
+        cmd = [blender, "--factory-startup", "-b", "--python-exit-code", "3",
+               "--python", str(REPO / "builder" / "builder.py"), "--",
+               "--spec", str(spec_arg), "--out", str(out), "--repo", str(REPO)] + extra
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=BUILD_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            print(f"forge: {slug}: build timed out after {BUILD_TIMEOUT_S}s", file=sys.stderr)
+            worst = max(worst, 3)
+            continue
+        for line in proc.stdout.splitlines():
+            if line.startswith("forge-builder:"):
+                print(line)
+        rc = proc.returncode
+        if rc not in (0, 1):
+            tail = "\n".join((proc.stderr or proc.stdout).splitlines()[-15:])
+            print(f"forge: {slug}: builder failed (exit {rc})\n{tail}", file=sys.stderr)
+            worst = max(worst, 3)
+            continue
+        if not (out / "report.json").is_file():
+            print(f"forge: {slug}: no report.json produced", file=sys.stderr)
+            worst = max(worst, 3)
+            continue
+        worst = max(worst, rc)
+    return worst
+
+
+def _find_spec(slug):
+    # `harvested/` is NOT `specs/`. A spec is a build recipe validated against
+    # forgeSpec v1 and rebuildable byte-identically; a harvest manifest records
+    # where a sourced asset came from and what was done to it. Filing them
+    # together broke `forge validate --all` (5 test groups), because a manifest
+    # cannot satisfy a schema for something that was never built here.
+    for d in ("specs", "examples", "harvested"):
+        p = REPO / d / f"{slug}.json"
+        if p.is_file():
+            try:
+                return json.loads(p.read_text())
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+SHEET_CSS = """
+body{font:14px/1.45 -apple-system,'Segoe UI',sans-serif;background:#f6f2ea;color:#2b2620;margin:24px}
+h1{font-size:20px;margin:0 0 4px} .meta{color:#8a8073;font-size:12px;margin:0 0 18px}
+table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e2d9c8}
+td,th{border-bottom:1px solid #eee6d6;padding:10px 12px;vertical-align:top;text-align:left}
+th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#8a8073}
+img{height:180px;width:180px;object-fit:contain;background:#f2ede4;border:1px solid #e2d9c8;border-radius:6px}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-weight:600;font-size:12px}
+.pass{background:#e5f3e5;color:#1e6b2e}.fail{background:#fbe4e4;color:#a3231f}
+.slug{font-weight:700;font-family:ui-monospace,SFMono-Regular,monospace}
+.small{font-size:12px;color:#6f675c;margin-top:4px}
+ul.fails{margin:6px 0 0 16px;padding:0;color:#a3231f;font-size:12px}
+.noref{color:#b0a795;font-size:12px}
+"""
+
+
+def cmd_sheet(_args):
+    import html as html_mod
+    from datetime import datetime, timezone
+
+    staging = REPO / "staging"
+    staged = sorted(d for d in staging.iterdir()
+                    if d.is_dir() and (d / "report.json").is_file()) if staging.is_dir() else []
+    if not staged:
+        print("forge: nothing staged — `forge build` something first", file=sys.stderr)
+        return 0
+
+    rows = []
+    for d in staged:
+        rep = json.loads((d / "report.json").read_text())
+        slug = rep.get("slug", d.name)
+        spec = _find_spec(slug) or {}
+        esc = html_mod.escape
+        hints = (spec.get("consumerHints") or {}).get("eventos") or {}
+        kind = hints.get("kind", "?")
+        badge = ('<span class="badge pass">all gates pass</span>' if rep.get("pass")
+                 else '<span class="badge fail">gate fail</span>')
+        fails = "".join(f"<li>{esc(x)}</li>" for x in rep.get("failures", []))
+        if fails:
+            badge += f'<ul class="fails">{fails}</ul>'
+        refs = "".join(
+            f'<img src="../specs/{esc(r)}" alt="reference">'
+            for r in spec.get("referenceImages", []) or []
+        ) or '<span class="noref">no reference (spec-authored)</span>'
+        imgs = {p: f'<img src="{esc(slug)}/{p}" alt="{p}">' if (d / p).is_file()
+                else f'<span class="noref">no {p}</span>' for p in ("thumb.png", "front.png")}
+        metrics = (f"{rep.get('triCount', '?')} / {rep.get('budget', '?')} tris · "
+                   f"{rep.get('fileBytes', 0):,} B<br>"
+                   f"bounds {' × '.join(str(x) for x in rep.get('boundsM', []))} m · "
+                   f"baseY {rep.get('baseY', '?')}")
+        rows.append(
+            f"<tr><td><div class='slug'>{esc(slug)}</div>"
+            f"<div class='small'>{esc(spec.get('label', ''))}</div>"
+            f"<div class='small'>{esc(kind)} · {esc(spec.get('detail', '?'))} poly</div></td>"
+            f"<td>{imgs['thumb.png']}</td><td>{imgs['front.png']}</td><td>{refs}</td>"
+            f"<td class='small'>{metrics}</td><td>{badge}</td></tr>"
+        )
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    doc = (f"<!doctype html><html><head><meta charset='utf-8'>"
+           f"<title>Forge contact sheet</title><style>{SHEET_CSS}</style></head><body>"
+           f"<h1>Blender Forge — contact sheet</h1>"
+           f"<p class='meta'>generated {ts} · {len(rows)} staged asset(s) · approve by "
+           f"telling the build session which slugs to <code>forge import</code></p>"
+           f"<table><tr><th>asset</th><th>thumb (¾)</th><th>front</th><th>reference</th>"
+           f"<th>metrics</th><th>gates</th></tr>{''.join(rows)}</table></body></html>")
+    out = staging / "contact-sheet.html"
+    out.write_text(doc)
+    print(f"forge: contact sheet → {out} ({len(rows)} asset(s))")
+    return 0
+
+
+FROM_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def cmd_from_image(args):
+    img_path = slug = None
+    it = iter(range(len(args)))
+    i = 0
+    while i < len(args):
+        if args[i] == "--slug" and i + 1 < len(args):
+            slug = args[i + 1]
+            i += 2
+        else:
+            img_path = args[i]
+            i += 1
+    if not img_path or not slug:
+        print("usage: forge from-image <image> --slug <slug>", file=sys.stderr)
+        return 2
+    if not SLUG_RE.match(slug):
+        print(f"forge: slug '{slug}' must be kebab-case", file=sys.stderr)
+        return 2
+    src = Path(img_path)
+    if not src.is_file() or src.suffix.lower() not in FROM_IMAGE_EXTS:
+        print(f"forge: '{img_path}' is not an image file ({'/'.join(sorted(FROM_IMAGE_EXTS))})",
+              file=sys.stderr)
+        return 2
+    spec_path = REPO / "specs" / f"{slug}.json"
+    if spec_path.exists():
+        print(f"forge: {spec_path} already exists — pick another slug or edit that spec",
+              file=sys.stderr)
+        return 2
+
+    ref_dir = REPO / "specs" / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    dest = ref_dir / f"{slug}{src.suffix.lower()}"
+    dest.write_bytes(src.read_bytes())
+
+    scaffold = {
+        "forgeSpec": 1,
+        "slug": slug,
+        "label": f"{slug} (TODO: rebuild from {src.name})",
+        "detail": "low",
+        "referenceImages": [f"references/{dest.name}"],
+        "consumerHints": {"eventos": {"kind": "decor", "category": "props",
+                                      "footprintM": 1.0, "heightM": 1.0,
+                                      "placement": "floor"}},
+        "materials": {"todo": {"color": "#c8c0b4", "roughness": 0.8}},
+        "parts": [{"name": "todo-body", "type": "box", "position": [0, 0.5, 0],
+                   "material": "todo", "size": [1.0, 1.0, 1.0]}],
+    }
+    spec_path.write_text(json.dumps(scaffold, indent=2) + "\n")
+    print(f"forge: reference → {dest}\nforge: scaffold  → {spec_path}\n"
+          f"Now follow SPEC_GUIDE §Image→spec protocol:\n"
+          f"  1. estimate real-world dimensions (state assumptions)\n"
+          f"  2. decompose into ≤ 10 primitives, biggest silhouette first\n"
+          f"  3. extract ≤ 4 colours\n"
+          f"  4. edit the spec → ./forge build {slug} → compare thumb vs reference\n"
+          f"  5. iterate ≤ 3: silhouette → proportions → palette")
+    return 0
+
+
+def _fallback_shape(spec):
+    for part in spec.get("parts", []):
+        t = part.get("type")
+        if t == "array":
+            t = (part.get("of") or {}).get("type")
+        if t in ("cylinder", "lathe"):
+            return "cylinder"
+    return "box"
+
+
+def _first_color(spec):
+    for mat in (spec.get("materials") or {}).values():
+        if isinstance(mat, dict) and mat.get("color"):
+            return mat["color"]
+    return "#c8c0b4"
+
+
+COMPONENT_CHECKLIST = """# Import checklist — {slug} (component lane)
+
+GLB copied to `{glb_dest}`. Forge NEVER edits consumer TS — a dev completes these
+in the consumer repo (plan §Eventos integration B):
+
+1. `floor-plan-types.ts`: add `"{component_type}"` to the component-type enum/zod schema
+2. Component def: dims {footprint} × {height} m, label "{label}", palette group
+3. `FLOOR_3D_SPECS["{component_type}"]` entry with `assetSlug: "{slug}"`
+4. Editor palette entry so planners can place it
+5. pictureSurface default: {picture_surface} (per-face looks/upload flow)
+6. typecheck + vitest + browser-verify palette → place → 3D round trip
+
+Ready-to-paste data:
+
+```json
+{snippet}
+```
+"""
+
+
+
+HARVEST_GATES = {
+    # Sourced organic assets carry photographic textures and cannot meet the
+    # procedural lane's byte budget — the existing catalogue is 4–39 KB because
+    # those assets are untextured boxes and lathes. Measured on the first real
+    # harvest: a rose at 12k tris with 512px maps is 830 KB. 1.5 MB leaves head-
+    # room for a denser piece without letting a 4 MB one through unnoticed.
+    "maxBytes": 1_500_000,
+    "maxTris": 40_000,
+}
+
+
+def cmd_harvest(args):
+    """Turn a sourced .blend into a staged two-LOD asset `forge import` accepts.
+
+    The judgment stays human — someone searches, picks, deletes the parts they
+    do not want, saves. This runs everything after that and stages the result
+    in exactly the shape the build lane produces, so `forge import` needs no
+    special case for harvested assets.
+    """
+    import hashlib
+    import subprocess
+    from datetime import datetime, timezone
+
+    o = {"budget": "12000", "min-ratio": "0.20", "category": "props", "placement": "floor",
+         "keep": "", "drop": "", "label": None, "source": None, "slug": None,
+         "license": "unknown", "source-url": "", "author": ""}
+    i = 0
+    while i < len(args):
+        key = args[i][2:] if args[i].startswith("--") else None
+        if key in o and i + 1 < len(args):
+            o[key], i = args[i + 1], i + 2
+        else:
+            print("usage: forge harvest --source <blend> --slug <slug> --label <label> "
+                  "[--category props] [--budget 12000] [--min-ratio 0.20] "
+                  "[--keep a,b] [--drop c] "
+                  "[--license cc_zero] [--source-url URL] [--author NAME]", file=sys.stderr)
+            return 2
+    if not o["source"] or not o["slug"] or not o["label"]:
+        print("forge harvest: --source, --slug and --label are all required", file=sys.stderr)
+        return 2
+
+    slug = o["slug"]
+    src = Path(o["source"]).expanduser().resolve()
+    if not src.is_file():
+        print(f"forge: {src} not found", file=sys.stderr)
+        return 2
+
+    staged = REPO / "staging" / slug
+    staged.mkdir(parents=True, exist_ok=True)
+    blender = find_blender()
+    if not blender:
+        print("forge: blender not found — run `forge doctor`", file=sys.stderr)
+        return 3
+
+    cmd = [blender, "--background", "--factory-startup", "--python-exit-code", "3",
+           "-P", str(REPO / "builder" / "harvest.py"), "--",
+           "--source", str(src), "--slug", slug, "--out-dir", str(staged),
+           "--budget", o["budget"], "--min-ratio", o["min-ratio"]]
+    if o["keep"]:
+        cmd += ["--keep", o["keep"]]
+    if o["drop"]:
+        cmd += ["--drop", o["drop"]]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-2000:])
+        print(f"forge: {slug}: harvest failed (exit {proc.returncode})", file=sys.stderr)
+        return 1
+
+    hj = staged / "harvest.json"
+    if not hj.is_file():
+        print(f"forge: {slug}: harvest produced no report", file=sys.stderr)
+        return 1
+    h = json.loads(hj.read_text())
+
+    # `forge import` reads thumb.png; harvest names it after the slug.
+    (staged / "thumb.png").write_bytes((staged / f"{slug}.png").read_bytes())
+
+    dims, tris = h["dims"], h["decimate"]["after"]
+    lo_bytes = h["bytes"]["lo"]
+    gates = {
+        "budget": "pass" if tris <= HARVEST_GATES["maxTris"] else "fail",
+        "fileSize": "pass" if lo_bytes <= HARVEST_GATES["maxBytes"] else "fail",
+        "geometry": "pass" if tris > 0 else "fail",
+        # The decimator floors rather than failing, and collapse near the floor
+        # shreds thin geometry. harvest.py already refuses; this records it.
+        "decimateFloor": "fail" if h["decimate"].get("floored") else "pass",
+        # A collapse far below the base cage flattens curved detail into facets
+        # while every count-based gate still reads pass — this is what shipped a
+        # ruined rose at 10.6% of its cage. harvest.py refuses; this records it.
+        "collapseRatio": "fail" if h["decimate"].get("tooAggressive") else "pass",
+        "footprint": "pass" if 0.02 <= max(dims.values()) <= 30 else "fail",
+    }
+    failures = [k for k, v in gates.items() if v != "pass"]
+
+    # Not a spec sha — there is no spec. Hashing the source plus the knobs
+    # keeps the ledger honest: re-harvesting the same file the same way is
+    # the same asset, and changing the budget is not.
+    digest = hashlib.sha256(
+        src.read_bytes() + f"|{o['budget']}|{o['keep']}|{o['drop']}".encode()
+    ).hexdigest()
+
+    (staged / "report.json").write_text(json.dumps({
+        "slug": slug, "pass": not failures, "triCount": tris,
+        "budget": int(o["budget"]),
+        "boundsM": [dims["widthM"], dims["depthM"], dims["heightM"]],
+        "baseY": 0.0, "materialCount": 1, "fileBytes": lo_bytes,
+        "gates": gates, "failures": failures,
+        "forgeVersion": FORGE_VERSION if "FORGE_VERSION" in globals() else "0.1.0",
+        "specSha256": digest,
+        "builtAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "harvested": True,
+    }, indent=2) + "\n")
+
+    footprint = round(max(dims["widthM"], dims["depthM"]), 3)
+    (REPO / "harvested").mkdir(exist_ok=True)
+    (REPO / "harvested" / f"{slug}.json").write_text(json.dumps({
+        "slug": slug, "label": o["label"],
+        # Shown as the poly-tier chip in the review UI. Not "low"/"high" --
+        # those are Forge budget tiers and this asset was not built to one.
+        "detail": "sourced",
+        "harvested": {
+            "source": str(src), "license": o["license"],
+            "sourceUrl": o["source-url"], "author": o["author"],
+            "originalTris": h["decimate"]["before"], "shippedTris": tris,
+        },
+        # `_first_color` reads spec["materials"]; giving it one keeps the
+        # import lane identical for harvested and built assets.
+        "materials": {"main": {"color": h.get("dominantColor", "#c8c0b4")}},
+        "consumerHints": {"eventos": {
+            "kind": "decor", "category": o["category"],
+            "footprintM": footprint, "heightM": round(dims["heightM"], 3),
+            "defaultHeightM": 0.0, "placement": o["placement"],
+        }},
+    }, indent=2) + "\n")
+
+    verdict = "PASS" if not failures else "FAIL: " + ", ".join(failures)
+    print(f"forge: {slug} harvested — {h['decimate']['before']:,} → {tris:,} tris, "
+          f"{lo_bytes/1024:.0f} KB web / {h['bytes']['hi']/1048576:.1f} MB render, "
+          f"{dims['widthM']:.2f} × {dims['depthM']:.2f} × {dims['heightM']:.2f} m  [{verdict}]")
+    if failures:
+        return 1
+    print(f"forge: next → forge import --consumer eventos --slugs {slug}")
+    return 0
+
+
+def cmd_import(args):
+    from datetime import datetime, timezone
+
+    consumer = slugs = None
+    authored = "unattributed"
+    i = 0
+    while i < len(args):
+        if args[i] == "--consumer" and i + 1 < len(args):
+            consumer, i = args[i + 1], i + 2
+        elif args[i] == "--slugs" and i + 1 < len(args):
+            slugs, i = [s for s in args[i + 1].split(",") if s], i + 2
+        elif args[i] == "--authored-by" and i + 1 < len(args):
+            authored, i = args[i + 1], i + 2
+        else:
+            print("usage: forge import --consumer <name> --slugs a,b [--authored-by <model>]",
+                  file=sys.stderr)
+            return 2
+    if not consumer or not slugs:
+        print("usage: forge import --consumer <name> --slugs a,b [--authored-by <model>]",
+              file=sys.stderr)
+        return 2
+
+    consumers_path = Path(os.environ.get("FORGE_CONSUMERS", REPO / "consumers.json"))
+    library_path = Path(os.environ.get("FORGE_LIBRARY", REPO / "library.json"))
+    consumers = json.loads(consumers_path.read_text())
+    if consumer not in consumers:
+        print(f"forge: unknown consumer '{consumer}' (see {consumers_path})", file=sys.stderr)
+        return 2
+    cfg = consumers[consumer]
+    root = Path(cfg["root"])
+    library = json.loads(library_path.read_text())
+
+    worst = 0
+    for slug in slugs:
+        staged = REPO / "staging" / slug
+        if not (staged / "report.json").is_file():
+            print(f"forge: {slug}: not staged — `forge build {slug}` first", file=sys.stderr)
+            worst = max(worst, 2)
+            continue
+        report = json.loads((staged / "report.json").read_text())
+        if not report.get("pass"):
+            print(f"forge: {slug}: gates failing — fix the spec before import", file=sys.stderr)
+            worst = max(worst, 1)
+            continue
+        spec = _find_spec(slug)
+        hints = ((spec or {}).get("consumerHints") or {}).get(consumer)
+        if not hints:
+            print(f"forge: {slug}: spec missing consumerHints.{consumer}", file=sys.stderr)
+            worst = max(worst, 2)
+            continue
+        glb_src = staged / f"{slug}.glb"
+        files = []
+
+        if hints["kind"] == "decor":
+            catalog_p = root / cfg["decor"]["catalogJson"]
+            if not catalog_p.is_file():
+                print(f"forge: {slug}: {catalog_p} missing — run eventos integration §A first",
+                      file=sys.stderr)
+                worst = max(worst, 3)
+                continue
+            catalog = json.loads(catalog_p.read_text())
+            if any(e.get("slug") == slug for e in catalog):
+                print(f"forge: {slug}: already in {catalog_p.name} — remove it first to re-import",
+                      file=sys.stderr)
+                worst = max(worst, 2)
+                continue
+            glb_dest = root / cfg["decor"]["glbDir"] / f"{slug}.glb"
+            thumb_dest = root / cfg["decor"]["thumbDir"] / f"{slug}.png"
+            glb_dest.parent.mkdir(parents=True, exist_ok=True)
+            thumb_dest.parent.mkdir(parents=True, exist_ok=True)
+            glb_dest.write_bytes(glb_src.read_bytes())
+            thumb_dest.write_bytes((staged / "thumb.png").read_bytes())
+            # Two-LOD assets ship a render-quality sibling. Optional on
+            # purpose: every Forge-built asset predates this and has none.
+            hi_src = staged / f"{slug}.hi.glb"
+            if hi_src.is_file():
+                hi_dest = root / cfg["decor"]["glbDir"] / f"{slug}.hi.glb"
+                hi_dest.write_bytes(hi_src.read_bytes())
+            catalog.append({
+                "slug": slug,
+                "label": spec["label"],
+                "category": hints.get("category", "props"),
+                "footprintM": hints["footprintM"],
+                "defaultHeightM": hints.get("defaultHeightM", 0),
+                "heightM": hints["heightM"],
+                "fallbackShape": _fallback_shape(spec),
+                "fallbackColor": _first_color(spec),
+                "placement": hints.get("placement", "floor"),
+            })
+            catalog_p.write_text(json.dumps(catalog, indent=2) + "\n")
+            files = [str(glb_dest), str(thumb_dest), str(catalog_p)]
+            if hi_src.is_file():
+                files.append(str(hi_dest))
+            print(f"forge: {slug} → décor lane: GLB + thumb copied, catalog entry appended")
+
+        else:  # component lane: copy GLB, emit checklist, STOP — never edit TS
+            glb_dest = root / cfg["component"]["glbDir"] / f"{slug}.glb"
+            if glb_dest.exists():
+                print(f"forge: {slug}: {glb_dest} already exists — remove it to re-import",
+                      file=sys.stderr)
+                worst = max(worst, 2)
+                continue
+            glb_dest.parent.mkdir(parents=True, exist_ok=True)
+            glb_dest.write_bytes(glb_src.read_bytes())
+            ps = spec.get("pictureSurface")
+            snippet = json.dumps({
+                "componentType": hints["componentType"],
+                "label": spec["label"],
+                "footprintM": hints["footprintM"],
+                "heightM": hints["heightM"],
+                "assetSlug": slug,
+                "pictureSurface": ps,
+            }, indent=2)
+            checklist = COMPONENT_CHECKLIST.format(
+                slug=slug, glb_dest=glb_dest, component_type=hints["componentType"],
+                footprint=hints["footprintM"], height=hints["heightM"], label=spec["label"],
+                picture_surface=(f"face \"{ps['face']}\" of part \"{ps['part']}\"" if ps else "none"),
+                snippet=snippet)
+            (staged / "import-checklist.md").write_text(checklist)
+            files = [str(glb_dest)]
+            print(f"forge: {slug} → component lane: GLB copied; dev checklist at "
+                  f"{staged / 'import-checklist.md'} (TS edits are a dev task — stopping here)")
+
+        credits = root / cfg.get("credits", "")
+        if cfg.get("credits") and credits.is_file():
+            hv = spec.get("harvested")
+            with credits.open("a") as fh:
+                if hv:
+                    # A harvested asset is somebody else's work. Recording it
+                    # as a "Forge original" would make this file a fiction,
+                    # and this file is the only provenance record there is.
+                    who = hv.get("author") or "unknown author"
+                    fh.write(f"- Harvested: `{slug}` — {who}, licence "
+                             f"{hv.get('license', 'unknown')}"
+                             f"{', ' + hv['sourceUrl'] if hv.get('sourceUrl') else ''}"
+                             f" (imported {datetime.now(timezone.utc).date()})\n")
+                else:
+                    fh.write(f"- Blender Forge original: `{slug}` (spec sha "
+                             f"{report['specSha256'][:8]}, imported "
+                             f"{datetime.now(timezone.utc).date()})\n")
+            files.append(str(credits))
+
+        library["assets"].append({
+            "slug": slug,
+            "specSha256": report["specSha256"],
+            "consumer": consumer,
+            "kind": hints["kind"],
+            "files": files,
+            "importedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "authoredBy": authored,
+        })
+        library_path.write_text(json.dumps(library, indent=2) + "\n")
+
+    return worst
+
+
+REVIEW_DECISIONS = ("approved", "changes", "rejected", "pending")
+REVIEW_MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript",
+               ".json": "application/json", ".css": "text/css", ".png": "image/png",
+               ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+               ".glb": "model/gltf-binary",
+               ".wasm": "application/wasm"}
+
+
+def _staged_assets():
+    """Everything `forge review` needs per staged asset, JSON-ready."""
+    staging = REPO / "staging"
+    if not staging.is_dir():
+        return []
+    try:
+        lib = json.loads((REPO / "library.json").read_text()).get("assets", [])
+    except (OSError, json.JSONDecodeError):
+        lib = []
+    out = []
+    for d in sorted(staging.iterdir()):
+        rep_p = d / "report.json"
+        if not d.is_dir() or not rep_p.is_file():
+            continue
+        try:
+            rep = json.loads(rep_p.read_text())
+        except json.JSONDecodeError:
+            continue
+        slug = rep.get("slug", d.name)
+        spec = _find_spec(slug) or {}
+        decision = None
+        if (d / "decision.json").is_file():
+            try:
+                decision = json.loads((d / "decision.json").read_text())
+            except json.JSONDecodeError:
+                pass
+        out.append({
+            "slug": slug,
+            "label": spec.get("label", slug),
+            "detail": spec.get("detail"),
+            "hints": (spec.get("consumerHints") or {}).get("eventos") or {},
+            "report": rep,
+            "decision": decision,
+            "referenceImages": spec.get("referenceImages") or [],
+            "shipped": sorted({a["consumer"] for a in lib if a.get("slug") == slug}),
+            "hasGlb": (d / f"{slug}.glb").is_file(),
+            "thumb": (d / "thumb.png").is_file(),
+        })
+    return out
+
+
+def cmd_review(args):
+    """Serve the interactive review UI on localhost. Decisions are written to
+    staging/<slug>/decision.json — import stays a separate, deliberate step."""
+    import webbrowser
+    from datetime import datetime, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import unquote
+
+    port, open_browser = 8137, True
+    i = 0
+    while i < len(args):
+        if args[i] == "--port" and i + 1 < len(args):
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                print("forge: --port takes a number", file=sys.stderr)
+                return 2
+            i += 2
+        elif args[i] == "--no-open":
+            open_browser, i = False, i + 1
+        else:
+            print("usage: forge review [--port N] [--no-open]", file=sys.stderr)
+            return 2
+
+    index = REPO / "review" / "index.html"
+    if not index.is_file():
+        print("forge: review/index.html missing — repo incomplete", file=sys.stderr)
+        return 3
+
+    def safe_file(base, rel):
+        p = (base / rel).resolve()
+        try:
+            p.relative_to(base.resolve())
+        except ValueError:
+            return None
+        return p if p.is_file() else None
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):  # keep the terminal quiet
+            pass
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
+                return self._send(200, index.read_bytes(), REVIEW_MIME[".html"])
+            if path == "/api/staged":
+                return self._send(200, _staged_assets())
+            for prefix, base in (("/vendor/", REPO / "review" / "vendor"),
+                                 ("/staging/", REPO / "staging"),
+                                 ("/specs/references/", REPO / "specs" / "references")):
+                if path.startswith(prefix):
+                    f = safe_file(base, unquote(path[len(prefix):]))
+                    if f:
+                        return self._send(200, f.read_bytes(),
+                                          REVIEW_MIME.get(f.suffix.lower(),
+                                                          "application/octet-stream"))
+                    return self._send(404, {"error": "not found"})
+            return self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path.split("?", 1)[0] != "/api/decision":
+                return self._send(404, {"error": "not found"})
+            try:
+                body = json.loads(self.rfile.read(
+                    int(self.headers.get("Content-Length", 0))) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._send(400, {"error": "bad JSON body"})
+            slug = body.get("slug", "")
+            decision = body.get("decision")
+            note = (body.get("note") or "").strip()
+            if not SLUG_RE.match(slug) or not (REPO / "staging" / slug / "report.json").is_file():
+                return self._send(400, {"error": f"'{slug}' is not a staged asset"})
+            if decision not in REVIEW_DECISIONS:
+                return self._send(400, {"error": f"decision must be one of {list(REVIEW_DECISIONS)}"})
+            if decision == "changes" and not note:
+                return self._send(400, {"error": "a change request needs a note"})
+            if len(note) > 4000:
+                return self._send(400, {"error": "note too long (4000 chars max)"})
+            dec_p = REPO / "staging" / slug / "decision.json"
+            if decision == "pending":
+                dec_p.unlink(missing_ok=True)
+                return self._send(200, {"slug": slug, "decision": None})
+            record = {"slug": slug, "decision": decision, "note": note,
+                      "decidedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            dec_p.write_text(json.dumps(record, indent=2) + "\n")
+            return self._send(200, record)
+
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        print(f"forge: cannot bind 127.0.0.1:{port} ({e.strerror}) — try --port", file=sys.stderr)
+        return 3
+    url = f"http://127.0.0.1:{port}/"
+    print(f"forge: review UI → {url}  (Ctrl-C to stop)\n"
+          f"forge: decisions land in staging/<slug>/decision.json; ship approved slugs with\n"
+          f"forge:   ./forge import --consumer eventos --slugs <a,b> --authored-by <model>")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nforge: review server stopped")
+    finally:
+        srv.server_close()
+    return 0
+
+
+def _stub(phase, what):
+    print(f"forge: {what} is not implemented yet — arrives in {phase} "
+          f"(see ~/dev/.claude/plans/grill-blender-forge.md)", file=sys.stderr)
+    return 3
+
+
+def main(argv):
+    if len(argv) < 1 or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "doctor":
+        return cmd_doctor(args)
+    if cmd == "validate":
+        return cmd_validate(args)
+    if cmd == "build":
+        return cmd_build(args)
+    if cmd == "sheet":
+        return cmd_sheet(args)
+    if cmd == "from-image":
+        return cmd_from_image(args)
+    if cmd == "harvest":
+        return cmd_harvest(args)
+    if cmd == "import":
+        return cmd_import(args)
+    if cmd == "review":
+        return cmd_review(args)
+    print(f"forge: unknown command '{cmd}' (try: forge help)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge.local/schema/forge-spec.schema.json",
+  "title": "forgeSpec v1",
+  "description": "Blender Forge asset spec. Units metres, angles degrees (XYZ Euler), Y-up right-handed, origin = base centre (all geometry y >= 0), +Z = front. `forge validate` is the enforcing implementation (adds cross-field rules: material refs, doubleSided for fabric, pictureSurface requires component kind + box part).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["forgeSpec", "slug", "label", "detail", "materials", "parts"],
+  "properties": {
+    "forgeSpec": { "const": 1 },
+    "slug": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+    "label": { "type": "string", "minLength": 1 },
+    "detail": { "enum": ["low", "mid"] },
+    "referenceImages": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "consumerHints": {
+      "type": "object",
+      "properties": { "eventos": { "$ref": "#/$defs/eventosHints" } },
+      "additionalProperties": { "type": "object" }
+    },
+    "materials": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 4,
+      "additionalProperties": { "$ref": "#/$defs/material" }
+    },
+    "parts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/part" }
+    },
+    "pictureSurface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["part", "face"],
+      "properties": {
+        "part": { "type": "string" },
+        "face": { "enum": ["front", "back", "left", "right", "top"] }
+      }
+    }
+  },
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "vec2": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "type": "number" }
+    },
+    "hexColor": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["color"],
+      "properties": {
+        "color": { "$ref": "#/$defs/hexColor" },
+        "roughness": { "type": "number", "minimum": 0, "maximum": 1 },
+        "metalness": { "type": "number", "minimum": 0, "maximum": 1 },
+        "emissive": { "$ref": "#/$defs/hexColor" },
+        "doubleSided": { "type": "boolean" }
+      }
+    },
+    "eventosHints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "footprintM", "heightM"],
+      "properties": {
+        "kind": { "enum": ["decor", "component"] },
+        "componentType": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "category": { "type": "string", "minLength": 1 },
+        "footprintM": { "type": "number", "exclusiveMinimum": 0 },
+        "heightM": { "type": "number", "exclusiveMinimum": 0 },
+        "defaultHeightM": { "type": "number", "minimum": 0 },
+        "placement": { "enum": ["floor", "ceiling", "wall"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "component" } } },
+          "then": { "required": ["componentType"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "decor" } } },
+          "then": { "required": ["category"] }
+        }
+      ]
+    },
+    "partCore": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+        "type": {
+          "enum": ["box", "cylinder", "plane", "lathe", "drape", "array"]
+        },
+        "position": { "$ref": "#/$defs/vec3" },
+        "rotationDeg": { "$ref": "#/$defs/vec3" },
+        "material": { "type": "string" }
+      },
+      "required": ["type"]
+    },
+    "part": {
+      "allOf": [
+        { "$ref": "#/$defs/partCore" },
+        { "required": ["name", "position"] },
+        { "$ref": "#/$defs/partByType" }
+      ]
+    },
+    "inlinePart": {
+      "allOf": [
+        { "$ref": "#/$defs/partCore" },
+        { "not": { "properties": { "type": { "const": "array" } } } },
+        { "$ref": "#/$defs/partByType" }
+      ]
+    },
+    "partByType": {
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "box" } } },
+          "then": {
+            "required": ["size", "material"],
+            "properties": {
+              "size": { "$ref": "#/$defs/vec3" },
+              "bevelM": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "cylinder" } } },
+          "then": {
+            "required": ["radiusTop", "radiusBottom", "heightM", "material"],
+            "properties": {
+              "radiusTop": { "type": "number", "minimum": 0 },
+              "radiusBottom": { "type": "number", "minimum": 0 },
+              "heightM": { "type": "number", "exclusiveMinimum": 0 },
+              "segments": { "type": "integer", "minimum": 3, "maximum": 64 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "plane" } } },
+          "then": {
+            "required": ["size", "material"],
+            "properties": { "size": { "$ref": "#/$defs/vec2" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "lathe" } } },
+          "then": {
+            "required": ["profile", "material"],
+            "properties": {
+              "profile": {
+                "type": "array",
+                "minItems": 2,
+                "items": { "$ref": "#/$defs/vec2" }
+              },
+              "segments": { "type": "integer", "minimum": 3, "maximum": 64 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "drape" } } },
+          "then": {
+            "required": ["from", "to", "sagM", "widthM", "material"],
+            "properties": {
+              "from": { "$ref": "#/$defs/vec3" },
+              "to": { "$ref": "#/$defs/vec3" },
+              "sagM": { "type": "number", "exclusiveMinimum": 0 },
+              "widthM": { "type": "number", "exclusiveMinimum": 0 },
+              "segmentsAlong": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 128
+              },
+              "segmentsAcross": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32
+              },
+              "gatherEnds": { "type": "boolean" },
+              "wrinkle": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["amplitudeM", "seed"],
+                "properties": {
+                  "amplitudeM": { "type": "number", "exclusiveMinimum": 0 },
+                  "seed": { "type": "integer" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "array" } } },
+          "then": {
+            "required": ["of", "mode", "count"],
+            "properties": {
+              "of": { "$ref": "#/$defs/inlinePart" },
+              "mode": { "enum": ["linear", "radial"] },
+              "count": { "type": "integer", "minimum": 2, "maximum": 256 },
+              "spacing": { "$ref": "#/$defs/vec3" },
+              "radiusM": { "type": "number", "exclusiveMinimum": 0 },
+              "startDeg": { "type": "number" },
+              "endDeg": { "type": "number" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

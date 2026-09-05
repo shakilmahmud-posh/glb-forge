@@ -1,0 +1,15 @@
+{
+  "forgeSpec": 1,
+  "slug": "neg-missing-size",
+  "label": "box without size",
+  "detail": "low",
+  "materials": { "body": { "color": "#888888" } },
+  "parts": [
+    {
+      "name": "cube",
+      "type": "box",
+      "position": [0, 0.25, 0],
+      "material": "body"
+    }
+  ]
+}

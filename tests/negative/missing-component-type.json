@@ -1,0 +1,19 @@
+{
+  "forgeSpec": 1,
+  "slug": "neg-missing-component-type",
+  "label": "kind=component without componentType",
+  "detail": "low",
+  "consumerHints": {
+    "eventos": { "kind": "component", "footprintM": 0.6, "heightM": 1.6 }
+  },
+  "materials": { "body": { "color": "#888888" } },
+  "parts": [
+    {
+      "name": "cube",
+      "type": "box",
+      "position": [0, 0.25, 0],
+      "material": "body",
+      "size": [0.5, 0.5, 0.5]
+    }
+  ]
+}

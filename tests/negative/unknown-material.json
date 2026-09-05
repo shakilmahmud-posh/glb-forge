@@ -1,0 +1,16 @@
+{
+  "forgeSpec": 1,
+  "slug": "neg-unknown-material",
+  "label": "part references undeclared material",
+  "detail": "low",
+  "materials": { "body": { "color": "#888888" } },
+  "parts": [
+    {
+      "name": "cube",
+      "type": "box",
+      "position": [0, 0.25, 0],
+      "material": "chrome",
+      "size": [0.5, 0.5, 0.5]
+    }
+  ]
+}

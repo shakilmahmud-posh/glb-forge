@@ -1,0 +1,13 @@
+# per-installation state, never the tool
+consumers.json
+library.json
+staging/
+harvested/
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# factory metadata — internal, not part of the public release
+.claude/
+CLAUDE.md

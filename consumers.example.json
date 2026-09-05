@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Copy to consumers.json and edit. `forge import` reads it to copy a built asset",
+    "into a downstream repo. Nothing else uses it, and a fresh clone needs it only",
+    "if you use the import lane. FORGE_CONSUMERS overrides the path.",
+    "",
+    "Each key is a consumer name. `root` is that repo's absolute path. Each lane",
+    "(here `decor`) says where GLBs, thumbnails and the catalog JSON live inside it.",
+    "`forge import` appends to the catalog and a ledger; it never edits source files."
+  ],
+  "my-app": {
+    "root": "/absolute/path/to/your/app",
+    "decor": {
+      "glbDir": "public/models/decor",
+      "thumbDir": "public/models/decor/thumbs",
+      "catalogJson": "src/data/decor-catalog.json",
+      "note": "import appends entries here; keep this a data file, not a source module"
+    },
+    "credits": "public/models/CREDITS.md"
+  }
+}

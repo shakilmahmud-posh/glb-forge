@@ -1,0 +1,54 @@
+{
+  "forgeSpec": 1,
+  "slug": "swag-single",
+  "label": "Ceiling swag \u2014 single 2 m fabric drape",
+  "detail": "low",
+  "consumerHints": {
+    "eventos": {
+      "kind": "decor",
+      "category": "ceiling",
+      "footprintM": 2.0,
+      "heightM": 0.71,
+      "defaultHeightM": 2.4,
+      "placement": "ceiling"
+    }
+  },
+  "materials": {
+    "fabric": {
+      "color": "#ddb9a6",
+      "roughness": 0.9,
+      "doubleSided": true
+    }
+  },
+  "parts": [
+    {
+      "name": "swag",
+      "type": "drape",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "material": "fabric",
+      "from": [
+        -1,
+        0.714,
+        0
+      ],
+      "to": [
+        1,
+        0.714,
+        0
+      ],
+      "sagM": 0.55,
+      "widthM": 0.6,
+      "segmentsAlong": 28,
+      "segmentsAcross": 8,
+      "gatherEnds": true,
+      "wrinkle": {
+        "amplitudeM": 0.09,
+        "seed": 7
+      }
+    }
+  ]
+}

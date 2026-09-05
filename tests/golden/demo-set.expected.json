@@ -1,0 +1,18 @@
+{
+  "pass": true,
+  "triCount": 168,
+  "materialCount": 2,
+  "boundsM": [
+    1.5428,
+    1.6645,
+    0.6736
+  ],
+  "gates": {
+    "budget": "pass",
+    "footprint": "skip",
+    "baseY": "pass",
+    "materials": "pass",
+    "fileSize": "pass",
+    "geometry": "pass"
+  }
+}

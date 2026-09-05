@@ -1,0 +1,16 @@
+{
+  "forgeSpec": 1,
+  "label": "negative",
+  "detail": "low",
+  "slug": "set-unknown-member",
+  "members": [
+    {
+      "spec": "no-such-spec-anywhere",
+      "position": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}
