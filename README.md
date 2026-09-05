@@ -116,9 +116,15 @@ sudo apt-get install -y --no-install-recommends \
   libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6
 ```
 
-**Verified:** the full suite, 60 assertions, on macOS arm64 with Blender 5.1.1. CI runs the same
-suite on Linux, which tests something a single laptop cannot — that the committed golden triangle
-counts hold on a different OS and CPU. If the badge above is green, cross-platform agreement holds.
+**Verified:** the full suite on macOS arm64 and, in CI on every push, on Linux x86-64 — both with
+Blender 5.1.1.
+
+That second run tests something a single laptop cannot. The golden triangle counts were committed
+from macOS; Linux reproduces them exactly — `demo-set` 168, `swag-single` 448, `x-banner` 84 — and
+rebuilds are byte-identical there too. So determinism is not an artefact of one machine.
+
+CI also evaluates `builder/gates.py` on a runner with **no Blender installed at all**, which is how
+the claim that gate logic is independent of Blender stays honest rather than aspirational.
 
 **Not verified:** Windows.
 
