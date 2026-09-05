@@ -16,12 +16,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Blender aborts with SIGABRT on a bare headless Linux box — "Couldn't
+      # open libEGL.so.1" — even in background mode with no window. `-b` does
+      # not mean "no graphics libraries"; it still initialises a GL context for
+      # offscreen rendering of thumbnails. These are the runtime libs it needs.
+      - name: System libraries for headless Blender
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libglx0 libgomp1 \
+            libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6
+
       # The version is pinned because it is load-bearing: procedural geometry
       # from a different Blender build can differ, and the golden reports
       # commit exact triangle counts. `forge doctor` fails on a mismatch.
       - name: Cache Blender ${{ env.BLENDER_VERSION }}
         id: cache-blender
-        uses: actions/cache@v4
+        uses: actions/cache@v4  # pinned; v5 not yet published
         with:
           path: ~/blender
           key: blender-${{ env.BLENDER_VERSION }}-linux-x64

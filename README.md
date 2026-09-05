@@ -105,6 +105,17 @@ to regenerate the goldens.
 Python 3.9+. `npx` is optional (`gltf-transform inspect`). No pip install, no node_modules — the
 viewer's dependencies are vendored, see [THIRD-PARTY.md](THIRD-PARTY.md).
 
+**On headless Linux** (CI, Docker, a server), Blender needs graphics runtime libraries even in
+background mode — `-b` still initialises an offscreen GL context to render thumbnails. Without
+them it aborts with `Couldn't open libEGL.so.1` and a SIGABRT, which reads like a corrupt install
+rather than a missing dependency:
+
+```bash
+sudo apt-get install -y --no-install-recommends \
+  libegl1 libgl1 libglx0 libgomp1 \
+  libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6
+```
+
 **Verified:** the full suite, 60 assertions, on macOS arm64 with Blender 5.1.1. CI runs the same
 suite on Linux, which tests something a single laptop cannot — that the committed golden triangle
 counts hold on a different OS and CPU. If the badge above is green, cross-platform agreement holds.
